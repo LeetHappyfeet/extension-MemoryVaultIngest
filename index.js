@@ -1,4 +1,4 @@
-/* MemoryVaultIngest v0.6.1 – chat-aware AIOS ingest + runtime prompt bridge */
+/* MemoryVaultIngest v0.6.2 – event-ID-aware AIOS ingest + runtime prompt bridge */
 
 import {
   eventSource,
@@ -199,21 +199,61 @@ async function activateRuntime(ctx) {
   }
 }
 
+function messageRole(message) {
+  const isSystem = Boolean(message?.is_system);
+  const isUser = !isSystem && Boolean(message?.is_user || message?.sender === "user");
+  const isCharacter = !isSystem && !isUser;
+  return { isSystem, isUser, isCharacter };
+}
+
 function latestMessage(ctx, speakerType) {
   return [...(ctx?.chat ?? [])].reverse().find(message => {
-    const isUser = message?.is_user || message?.sender === "user";
-    return speakerType === "user" ? isUser : !isUser;
+    const { isUser, isCharacter } = messageRole(message);
+    return speakerType === "user" ? isUser : isCharacter;
   });
 }
 
-async function pushLine(speakerType) {
+function messageById(ctx, messageId) {
+  if (messageId === undefined || messageId === null || messageId === "") return null;
+  return ctx?.chat?.[messageId] ?? null;
+}
+
+async function pushLine(speakerType, messageId = null) {
   const ctx = getContext();
   ensureIdentityMatches(ctx);
 
-  const msg = latestMessage(ctx, speakerType);
+  let msg = messageById(ctx, messageId);
+  let usedFallback = false;
+
+  if (msg) {
+    const { isUser, isCharacter } = messageRole(msg);
+    const roleMatches = speakerType === "user" ? isUser : isCharacter;
+    if (!roleMatches) {
+      console.warn(
+        `[${MODULE_NAME}] event message ${String(messageId)} did not match ${speakerType}; falling back`,
+      );
+      msg = null;
+    }
+  }
+
+  if (!msg) {
+    msg = latestMessage(ctx, speakerType);
+    usedFallback = true;
+  }
+
   if (!msg?.mes) {
-    console.warn(`[${MODULE_NAME}] no message found for ${speakerType}`);
+    console.warn(
+      `[${MODULE_NAME}] no message found for ${speakerType}`,
+      { messageId },
+    );
     return;
+  }
+
+  if (usedFallback && messageId !== null && messageId !== undefined) {
+    console.debug(
+      `[${MODULE_NAME}] used latest-message fallback for ${speakerType}`,
+      { messageId },
+    );
   }
 
   try {
@@ -238,6 +278,7 @@ async function pushLine(speakerType) {
         source: "SillyTavern",
         chat_id: ctx?.chatId ?? null,
         group_id: ctx?.groupId ?? null,
+        message_id: messageId ?? null,
       },
     };
 
@@ -354,17 +395,23 @@ window[`${MODULE_NAME}_Intercept`] = async function (_chat, _maxContext, _abort,
 
 eventSource.on(LISTEN_SENT, () => {
   console.debug(`[${MODULE_NAME}] MESSAGE_SENT observed; waiting for user render`);
-  eventSource.once(LISTEN_USER, async () => {
-    console.debug(`[${MODULE_NAME}] USER_MESSAGE_RENDERED observed`);
-    await pushLine("user");
+  eventSource.once(LISTEN_USER, async (messageId) => {
+    console.debug(
+      `[${MODULE_NAME}] USER_MESSAGE_RENDERED observed`,
+      { messageId },
+    );
+    await pushLine("user", messageId);
   });
 });
 
 eventSource.on(LISTEN_AI, () => {
   console.debug(`[${MODULE_NAME}] MESSAGE_RECEIVED observed; waiting for character render`);
-  eventSource.once(LISTEN_AI_RENDERED, async () => {
-    console.debug(`[${MODULE_NAME}] CHARACTER_MESSAGE_RENDERED observed`);
-    await pushLine("character");
+  eventSource.once(LISTEN_AI_RENDERED, async (messageId) => {
+    console.debug(
+      `[${MODULE_NAME}] CHARACTER_MESSAGE_RENDERED observed`,
+      { messageId },
+    );
+    await pushLine("character", messageId);
   });
 });
 
@@ -414,4 +461,4 @@ jQuery(async () => {
   console.log(`[${MODULE_NAME}] settings panel registered`);
 });
 
-console.log(`[${MODULE_NAME}] v0.6.1 loaded (chat-aware AIOS ingest + runtime prompt bridge)`);
+console.log(`[${MODULE_NAME}] v0.6.2 loaded (event-ID-aware AIOS ingest + runtime prompt bridge)`);
