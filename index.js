@@ -1,4 +1,4 @@
-/* MemoryVaultIngest v0.7.1 – early ingest + bounded AIOS HUD preparation */
+/* MemoryVaultIngest v0.7.2 – source-branch aware HUD preparation */
 
 import {
   eventSource,
@@ -536,6 +536,7 @@ window[`${MODULE_NAME}_Intercept`] = async function (_chat, _maxContext, abort, 
     }
 
     let prompt = null;
+    let coordinateConflict = false;
     const nodeId = latestUserNodeId;
 
     if (nodeId && latestPreparedNodeId === nodeId && cachedHudText) {
@@ -549,7 +550,12 @@ window[`${MODULE_NAME}_Intercept`] = async function (_chat, _maxContext, abort, 
           retries: 0,
         });
       } catch (error) {
+        const message = String(error?.message ?? "");
+        coordinateConflict = message.startsWith("409 ") && message.includes("current active source head");
         if (!generationController.signal.aborted) console.warn(`[${MODULE_NAME}] generation-time prepare failed:`, error);
+        if (coordinateConflict) {
+          console.debug(`[${MODULE_NAME}] stale generation coordinates detected; skipping current-head fallbacks for this generation`);
+        }
       }
     }
 
@@ -558,11 +564,11 @@ window[`${MODULE_NAME}_Intercept`] = async function (_chat, _maxContext, abort, 
       return;
     }
 
-    if (!prompt && !generationController.signal.aborted) {
+    if (!prompt && !coordinateConflict && !generationController.signal.aborted) {
       prompt = await fetchRuntimePrompt(ctx, { signal: generationController.signal, timeoutMs: Math.max(50, budgetMs / 2), retries: 0 });
     }
 
-    if (!prompt && !generationController.signal.aborted) {
+    if (!prompt && !coordinateConflict && !generationController.signal.aborted) {
       prompt = await fetchLegacyMemoryPrompt(ctx, { signal: generationController.signal, timeoutMs: Math.max(50, budgetMs / 2) });
     }
 
@@ -676,4 +682,4 @@ jQuery(async () => {
   console.log(`[${MODULE_NAME}] settings panel registered`);
 });
 
-console.log(`[${MODULE_NAME}] v0.7.1 loaded (early ingest + bounded AIOS HUD prepare bridge)`);
+console.log(`[${MODULE_NAME}] v0.7.2 loaded (source-branch aware HUD prepare bridge)`);
