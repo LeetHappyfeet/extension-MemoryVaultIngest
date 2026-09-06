@@ -1,4 +1,4 @@
-/* MemoryVaultIngest v0.6.2 – event-ID-aware AIOS ingest + runtime prompt bridge */
+/* MemoryVaultIngest v0.7.0 – bounded AIOS HUD preparation + SillyTavern prompt bridge */
 
 import {
   eventSource,
@@ -22,8 +22,14 @@ const defaultSettings = {
   position: extension_prompt_types.IN_PROMPT,
   depth: 1,
   recentLimit: 12,
-  maxRetries: 2,
-  retryDelayMs: 500,
+  tokenBudget: 4000,
+  prepareWaitMs: 1200,
+  generationBudgetMs: 900,
+  requestTimeoutMs: 1800,
+  maxRetries: 1,
+  retryDelayMs: 250,
+  requireGenerationReady: true,
+  useCachedHud: true,
   tagWrapper: true,
   memoryFallback: true,
 };
@@ -39,10 +45,22 @@ let activeCharacterId = null;
 let activeUserName = null;
 let activeConversationKey = null;
 let lastInjectionKey = null;
+let pendingUserIngest = null;
+let latestUserNodeId = null;
+let latestPreparedNodeId = null;
+let cachedHudText = null;
+let cachedHudFreshness = null;
+let prefetchPromise = null;
 
 function settings() {
   if (!extension_settings[MODULE_NAME]) {
     extension_settings[MODULE_NAME] = structuredClone(defaultSettings);
+  } else {
+    for (const [key, value] of Object.entries(defaultSettings)) {
+      if (extension_settings[MODULE_NAME][key] === undefined) {
+        extension_settings[MODULE_NAME][key] = value;
+      }
+    }
   }
   return extension_settings[MODULE_NAME];
 }
@@ -63,6 +81,12 @@ function resetRuntimeIdentity() {
   activeUserName = null;
   activeConversationKey = null;
   lastInjectionKey = null;
+  pendingUserIngest = null;
+  latestUserNodeId = null;
+  latestPreparedNodeId = null;
+  cachedHudText = null;
+  cachedHudFreshness = null;
+  prefetchPromise = null;
 }
 
 function conversationKey(ctx) {
@@ -89,14 +113,11 @@ function ensureIdentityMatches(ctx) {
     (activeConversationKey && activeConversationKey !== nextConversationKey);
 
   if (identityChanged) {
-    console.debug(
-      `[${MODULE_NAME}] runtime identity changed; resetting AIOS session`,
-      {
-        character_id: characterId,
-        user_name: userName,
-        conversation: nextConversationKey,
-      },
-    );
+    console.debug(`[${MODULE_NAME}] runtime identity changed; resetting AIOS session`, {
+      character_id: characterId,
+      user_name: userName,
+      conversation: nextConversationKey,
+    });
     resetRuntimeIdentity();
   }
 
@@ -105,18 +126,37 @@ function ensureIdentityMatches(ctx) {
   activeConversationKey = nextConversationKey;
 }
 
-async function requestJson(url, options = {}, retries = 0, label = "request") {
-  const retryDelay = Number(settings().retryDelayMs ?? 500);
+function timeoutSignal(timeoutMs, parentSignal = null) {
+  const controller = new AbortController();
+  const timeout = Math.max(1, Number(timeoutMs || 1));
+  const timer = setTimeout(() => controller.abort(new DOMException("AIOS request timed out", "TimeoutError")), timeout);
+
+  const forwardAbort = () => controller.abort(parentSignal?.reason ?? new DOMException("Aborted", "AbortError"));
+  if (parentSignal) {
+    if (parentSignal.aborted) forwardAbort();
+    else parentSignal.addEventListener("abort", forwardAbort, { once: true });
+  }
+
+  return {
+    signal: controller.signal,
+    cleanup() {
+      clearTimeout(timer);
+      if (parentSignal) parentSignal.removeEventListener("abort", forwardAbort);
+    },
+  };
+}
+
+async function requestJson(url, options = {}, retries = 0, label = "request", timeoutMs = null) {
+  const retryDelay = Number(settings().retryDelayMs ?? 250);
+  const requestTimeout = Math.max(50, Number(timeoutMs ?? settings().requestTimeoutMs ?? 1800));
   let lastError = null;
   const method = options?.method ?? "GET";
 
   for (let attempt = 0; attempt <= retries; attempt++) {
+    const bounded = timeoutSignal(requestTimeout, options?.signal ?? null);
     try {
-      console.debug(
-        `[${MODULE_NAME}] AIOS -> ${label} (${method}) attempt ${attempt + 1}/${retries + 1}`,
-        url,
-      );
-      const response = await fetch(url, options);
+      console.debug(`[${MODULE_NAME}] AIOS -> ${label} (${method}) attempt ${attempt + 1}/${retries + 1}`, url);
+      const response = await fetch(url, { ...options, signal: bounded.signal });
       if (!response.ok) {
         const body = await response.text();
         throw new Error(`${response.status} ${response.statusText}: ${body}`);
@@ -126,17 +166,21 @@ async function requestJson(url, options = {}, retries = 0, label = "request") {
       return json;
     } catch (error) {
       lastError = error;
+      const aborted = bounded.signal.aborted || error?.name === "AbortError" || error?.name === "TimeoutError";
       console.warn(`[${MODULE_NAME}] AIOS !! ${label} failed:`, error);
+      if (aborted) break;
       if (attempt < retries) {
         await new Promise(resolve => setTimeout(resolve, retryDelay));
       }
+    } finally {
+      bounded.cleanup();
     }
   }
 
   throw lastError;
 }
 
-async function openSession(ctx) {
+async function openSession(ctx, options = {}) {
   ensureIdentityMatches(ctx);
   if (sessionId) return sessionId;
 
@@ -156,21 +200,22 @@ async function openSession(ctx) {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
-  }, 0, "session");
+    signal: options.signal,
+  }, 0, "session", options.timeoutMs);
 
   sessionId = json.session_id;
   console.debug(`[${MODULE_NAME}] opened AIOS session ${sessionId}`);
   return sessionId;
 }
 
-async function activateRuntime(ctx) {
+async function activateRuntime(ctx, options = {}) {
   ensureIdentityMatches(ctx);
   if (instanceId) return instanceId;
 
   const { characterId, userName } = currentIdentity(ctx);
   if (!characterId || !userName) return null;
 
-  await openSession(ctx);
+  await openSession(ctx, options);
 
   try {
     const json = await requestJson(
@@ -185,9 +230,11 @@ async function activateRuntime(ctx) {
           controller_type: "agent",
           controller_ref: `sillytavern:${characterId}`,
         }),
+        signal: options.signal,
       },
-      Number(settings().maxRetries ?? 2),
+      Number(options.retries ?? settings().maxRetries ?? 1),
       "activate",
+      options.timeoutMs,
     );
 
     instanceId = json.instance_id;
@@ -229,9 +276,7 @@ async function pushLine(speakerType, messageId = null) {
     const { isUser, isCharacter } = messageRole(msg);
     const roleMatches = speakerType === "user" ? isUser : isCharacter;
     if (!roleMatches) {
-      console.warn(
-        `[${MODULE_NAME}] event message ${String(messageId)} did not match ${speakerType}; falling back`,
-      );
+      console.warn(`[${MODULE_NAME}] event message ${String(messageId)} did not match ${speakerType}; falling back`);
       msg = null;
     }
   }
@@ -242,18 +287,12 @@ async function pushLine(speakerType, messageId = null) {
   }
 
   if (!msg?.mes) {
-    console.warn(
-      `[${MODULE_NAME}] no message found for ${speakerType}`,
-      { messageId },
-    );
-    return;
+    console.warn(`[${MODULE_NAME}] no message found for ${speakerType}`, { messageId });
+    return null;
   }
 
   if (usedFallback && messageId !== null && messageId !== undefined) {
-    console.debug(
-      `[${MODULE_NAME}] used latest-message fallback for ${speakerType}`,
-      { messageId },
-    );
+    console.debug(`[${MODULE_NAME}] used latest-message fallback for ${speakerType}`, { messageId });
   }
 
   try {
@@ -286,25 +325,83 @@ async function pushLine(speakerType, messageId = null) {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
-    }, Number(settings().maxRetries ?? 2), `ingest:${speakerType}`);
+    }, Number(settings().maxRetries ?? 1), `ingest:${speakerType}`);
 
     console.debug(`[${MODULE_NAME}] ingested ${speakerType}:`, json);
+    return json;
   } catch (error) {
     console.error(`[${MODULE_NAME}] ingest failed:`, error);
+    return null;
   }
 }
 
-async function fetchRuntimePrompt(ctx) {
-  const runtimeId = await activateRuntime(ctx);
+function formatHudText(text) {
+  if (!text) return "";
+  if (!settings().tagWrapper) return text;
+  return `<aios_hud>\nThe following is AIOS runtime context for the active character. Treat it as current character/world state and retrieved knowledge, not as dialogue spoken by the user.\n\n${text}\n</aios_hud>`;
+}
+
+function cachePreparedHud(json, nodeId) {
+  const text = typeof json?.text === "string" ? json.text.trim() : "";
+  if (!text) return null;
+  cachedHudText = text;
+  cachedHudFreshness = json?.freshness ?? null;
+  latestPreparedNodeId = nodeId ?? json?.freshness?.requested_source_node_id ?? null;
+  console.debug(`[${MODULE_NAME}] cached AIOS HUD`, {
+    generation_ready: json?.generation_ready,
+    requested_node: latestPreparedNodeId,
+    freshness: cachedHudFreshness,
+    chars: text.length,
+  });
+  return text;
+}
+
+async function prepareHud(ctx, nodeId, options = {}) {
+  const runtimeId = await activateRuntime(ctx, options);
   if (!runtimeId) return null;
 
-  const recentLimit = Math.max(1, Number(settings().recentLimit ?? 12));
+  const s = settings();
+  const params = new URLSearchParams();
+  if (nodeId) params.set("through_node_id", nodeId);
+  params.set("recent_limit", String(Math.max(1, Number(s.recentLimit ?? 12))));
+  if (Number(s.tokenBudget) > 0) params.set("token_budget", String(Math.max(256, Number(s.tokenBudget))));
+  params.set("wait_ms", String(Math.max(0, Math.min(Number(options.prepareWaitMs ?? s.prepareWaitMs ?? 1200), 10000))));
+
+  const json = await requestJson(
+    apiUrl(`/instance/${encodeURIComponent(runtimeId)}/prepare?${params.toString()}`),
+    { method: "POST", signal: options.signal },
+    Number(options.retries ?? 0),
+    "prepare",
+    options.timeoutMs,
+  );
+
+  if (json?.generation_ready) {
+    return cachePreparedHud(json, nodeId);
+  }
+
+  console.warn(`[${MODULE_NAME}] HUD returned but is not generation-ready`, json?.freshness ?? {});
+  if (!s.requireGenerationReady) {
+    return cachePreparedHud(json, nodeId);
+  }
+  return null;
+}
+
+async function fetchRuntimePrompt(ctx, options = {}) {
+  const runtimeId = await activateRuntime(ctx, options);
+  if (!runtimeId) return null;
+
+  const s = settings();
+  const params = new URLSearchParams({ recent_limit: String(Math.max(1, Number(s.recentLimit ?? 12))) });
+  if (Number(s.tokenBudget) > 0) params.set("token_budget", String(Math.max(256, Number(s.tokenBudget))));
+  params.set("wait_ms", "0");
+
   try {
     const json = await requestJson(
-      apiUrl(`/instance/${encodeURIComponent(runtimeId)}/frame/text?recent_limit=${recentLimit}`),
-      { method: "GET" },
-      Number(settings().maxRetries ?? 2),
+      apiUrl(`/instance/${encodeURIComponent(runtimeId)}/frame/text?${params.toString()}`),
+      { method: "GET", signal: options.signal },
+      0,
       "frame/text",
+      options.timeoutMs,
     );
     return typeof json?.text === "string" && json.text.trim() ? json.text.trim() : null;
   } catch (error) {
@@ -313,7 +410,7 @@ async function fetchRuntimePrompt(ctx) {
   }
 }
 
-async function fetchLegacyMemoryPrompt(ctx) {
+async function fetchLegacyMemoryPrompt(ctx, options = {}) {
   if (!settings().memoryFallback) return null;
 
   const { characterId, userName } = currentIdentity(ctx);
@@ -328,12 +425,7 @@ async function fetchLegacyMemoryPrompt(ctx) {
   );
 
   try {
-    const json = await requestJson(
-      url,
-      { method: "GET" },
-      Number(settings().maxRetries ?? 2),
-      "memory-fallback",
-    );
+    const json = await requestJson(url, { method: "GET", signal: options.signal }, 0, "memory-fallback", options.timeoutMs);
     const chunks = (json?.vector_matches ?? []).map(match => match?.content).filter(Boolean);
     return chunks.length ? chunks.join("\n---\n") : null;
   } catch (error) {
@@ -342,13 +434,48 @@ async function fetchLegacyMemoryPrompt(ctx) {
   }
 }
 
-async function buildAiosPrompt(ctx) {
-  const runtimePrompt = await fetchRuntimePrompt(ctx);
-  if (runtimePrompt) return runtimePrompt;
-  return await fetchLegacyMemoryPrompt(ctx);
+function startHudPrefetch(ctx, nodeId) {
+  if (!nodeId) return null;
+  if (prefetchPromise && latestPreparedNodeId === nodeId) return prefetchPromise;
+
+  const s = settings();
+  prefetchPromise = prepareHud(ctx, nodeId, {
+    timeoutMs: Math.max(Number(s.requestTimeoutMs ?? 1800), Number(s.prepareWaitMs ?? 1200) + 250),
+    prepareWaitMs: s.prepareWaitMs,
+    retries: 0,
+  }).catch(error => {
+    console.warn(`[${MODULE_NAME}] HUD prefetch failed:`, error);
+    return null;
+  }).finally(() => {
+    prefetchPromise = null;
+  });
+
+  return prefetchPromise;
 }
 
-window[`${MODULE_NAME}_Intercept`] = async function (_chat, _maxContext, _abort, type) {
+function injectPrompt(ctx, prompt, source = "fresh") {
+  const s = settings();
+  if (!prompt) {
+    setExtensionPrompt(MODULE_NAME, "", s.position ?? extension_prompt_types.IN_PROMPT, s.depth ?? 1);
+    return;
+  }
+
+  const { characterId } = currentIdentity(ctx);
+  const injectionKey = `${characterId}::${instanceId ?? "memory"}::${latestPreparedNodeId ?? latestUserNodeId ?? "unknown"}::${prompt.length}::${source}`;
+  if (injectionKey === lastInjectionKey) return;
+  lastInjectionKey = injectionKey;
+
+  setExtensionPrompt(
+    MODULE_NAME,
+    formatHudText(prompt),
+    s.position ?? extension_prompt_types.IN_PROMPT,
+    s.depth ?? 1,
+  );
+
+  console.debug(`[${MODULE_NAME}] injected AIOS HUD (${prompt.length} chars, ${source})`);
+}
+
+window[`${MODULE_NAME}_Intercept`] = async function (_chat, _maxContext, abort, type) {
   console.debug(`[${MODULE_NAME}] interceptor fired`, { type });
   if (type === "quiet") return;
 
@@ -357,60 +484,97 @@ window[`${MODULE_NAME}_Intercept`] = async function (_chat, _maxContext, _abort,
 
   const ctx = getContext();
   if (!ctx?.name2) return;
-
   ensureIdentityMatches(ctx);
 
   const lastUserMsg = latestMessage(ctx, "user");
   if (!lastUserMsg?.mes) return;
 
-  const prompt = await buildAiosPrompt(ctx);
-  if (!prompt) {
-    setExtensionPrompt(
-      MODULE_NAME,
-      "",
-      s.position ?? extension_prompt_types.IN_PROMPT,
-      s.depth ?? 1,
-    );
-    return;
+  const budgetMs = Math.max(50, Number(s.generationBudgetMs ?? 900));
+  const generationController = new AbortController();
+  const generationTimer = setTimeout(() => generationController.abort(new DOMException("AIOS generation budget exhausted", "TimeoutError")), budgetMs);
+  const forwardAbort = () => generationController.abort(new DOMException("SillyTavern generation aborted", "AbortError"));
+
+  if (abort?.signal) {
+    if (abort.signal.aborted) forwardAbort();
+    else abort.signal.addEventListener("abort", forwardAbort, { once: true });
   }
 
-  const { characterId } = currentIdentity(ctx);
-  const injectionKey = `${characterId}::${instanceId ?? "memory"}::${lastUserMsg.mes}::${prompt.length}`;
-  if (injectionKey === lastInjectionKey) return;
-  lastInjectionKey = injectionKey;
+  try {
+    if (pendingUserIngest) {
+      await Promise.race([
+        pendingUserIngest,
+        new Promise(resolve => generationController.signal.addEventListener("abort", () => resolve(null), { once: true })),
+      ]);
+    }
 
-  const formatted = s.tagWrapper
-    ? `<aios_context>\n${prompt}\n</aios_context>`
-    : prompt;
+    if (generationController.signal.aborted) {
+      if (s.useCachedHud && cachedHudText) injectPrompt(ctx, cachedHudText, "cached-budget");
+      return;
+    }
 
-  setExtensionPrompt(
-    MODULE_NAME,
-    formatted,
-    s.position ?? extension_prompt_types.IN_PROMPT,
-    s.depth ?? 1,
-  );
+    let prompt = null;
+    const nodeId = latestUserNodeId;
 
-  console.debug(`[${MODULE_NAME}] injected AIOS prompt (${prompt.length} chars)`);
+    if (nodeId && latestPreparedNodeId === nodeId && cachedHudText) {
+      prompt = cachedHudText;
+    } else if (nodeId) {
+      try {
+        prompt = await prepareHud(ctx, nodeId, {
+          signal: generationController.signal,
+          timeoutMs: budgetMs,
+          prepareWaitMs: Math.min(Number(s.prepareWaitMs ?? 1200), budgetMs),
+          retries: 0,
+        });
+      } catch (error) {
+        if (!generationController.signal.aborted) console.warn(`[${MODULE_NAME}] generation-time prepare failed:`, error);
+      }
+    }
+
+    if (!prompt && s.useCachedHud && cachedHudText) {
+      injectPrompt(ctx, cachedHudText, "cached");
+      return;
+    }
+
+    if (!prompt && !generationController.signal.aborted) {
+      prompt = await fetchRuntimePrompt(ctx, { signal: generationController.signal, timeoutMs: Math.max(50, budgetMs / 2), retries: 0 });
+    }
+
+    if (!prompt && !generationController.signal.aborted) {
+      prompt = await fetchLegacyMemoryPrompt(ctx, { signal: generationController.signal, timeoutMs: Math.max(50, budgetMs / 2) });
+    }
+
+    if (prompt) injectPrompt(ctx, prompt, latestPreparedNodeId === nodeId ? "fresh" : "fallback");
+    else if (!cachedHudText) injectPrompt(ctx, null);
+  } catch (error) {
+    console.warn(`[${MODULE_NAME}] interceptor failed open; SillyTavern generation will continue:`, error);
+    if (s.useCachedHud && cachedHudText) injectPrompt(ctx, cachedHudText, "cached-error");
+  } finally {
+    clearTimeout(generationTimer);
+    if (abort?.signal) abort.signal.removeEventListener("abort", forwardAbort);
+  }
 };
 
 eventSource.on(LISTEN_SENT, () => {
   console.debug(`[${MODULE_NAME}] MESSAGE_SENT observed; waiting for user render`);
-  eventSource.once(LISTEN_USER, async (messageId) => {
-    console.debug(
-      `[${MODULE_NAME}] USER_MESSAGE_RENDERED observed`,
-      { messageId },
-    );
-    await pushLine("user", messageId);
+  eventSource.once(LISTEN_USER, (messageId) => {
+    console.debug(`[${MODULE_NAME}] USER_MESSAGE_RENDERED observed`, { messageId });
+    const ctx = getContext();
+    pendingUserIngest = pushLine("user", messageId)
+      .then(json => {
+        latestUserNodeId = json?.node_id ?? null;
+        if (latestUserNodeId) startHudPrefetch(ctx, latestUserNodeId);
+        return json;
+      })
+      .finally(() => {
+        pendingUserIngest = null;
+      });
   });
 });
 
 eventSource.on(LISTEN_AI, () => {
   console.debug(`[${MODULE_NAME}] MESSAGE_RECEIVED observed; waiting for character render`);
   eventSource.once(LISTEN_AI_RENDERED, async (messageId) => {
-    console.debug(
-      `[${MODULE_NAME}] CHARACTER_MESSAGE_RENDERED observed`,
-      { messageId },
-    );
+    console.debug(`[${MODULE_NAME}] CHARACTER_MESSAGE_RENDERED observed`, { messageId });
     await pushLine("character", messageId);
   });
 });
@@ -448,6 +612,31 @@ jQuery(async () => {
     saveSettingsDebounced();
   });
 
+  $("#mvi_token_budget").val(s.tokenBudget ?? 4000).on("change", () => {
+    s.tokenBudget = Number($("#mvi_token_budget").val());
+    saveSettingsDebounced();
+  });
+
+  $("#mvi_prepare_wait").val(s.prepareWaitMs ?? 1200).on("change", () => {
+    s.prepareWaitMs = Number($("#mvi_prepare_wait").val());
+    saveSettingsDebounced();
+  });
+
+  $("#mvi_generation_budget").val(s.generationBudgetMs ?? 900).on("change", () => {
+    s.generationBudgetMs = Number($("#mvi_generation_budget").val());
+    saveSettingsDebounced();
+  });
+
+  $("#mvi_require_ready").prop("checked", s.requireGenerationReady).on("change", () => {
+    s.requireGenerationReady = !!$("#mvi_require_ready").prop("checked");
+    saveSettingsDebounced();
+  });
+
+  $("#mvi_cached_hud").prop("checked", s.useCachedHud).on("change", () => {
+    s.useCachedHud = !!$("#mvi_cached_hud").prop("checked");
+    saveSettingsDebounced();
+  });
+
   $("#mvi_tag").prop("checked", s.tagWrapper).on("change", () => {
     s.tagWrapper = !!$("#mvi_tag").prop("checked");
     saveSettingsDebounced();
@@ -461,4 +650,4 @@ jQuery(async () => {
   console.log(`[${MODULE_NAME}] settings panel registered`);
 });
 
-console.log(`[${MODULE_NAME}] v0.6.2 loaded (event-ID-aware AIOS ingest + runtime prompt bridge)`);
+console.log(`[${MODULE_NAME}] v0.7.0 loaded (bounded AIOS HUD prepare bridge)`);
