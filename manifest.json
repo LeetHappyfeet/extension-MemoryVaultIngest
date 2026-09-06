@@ -7,7 +7,7 @@
   "js": "index.js",
   "css": "",
   "author": "LeetHappyfeet",
-  "version": "0.6.1",
+  "version": "0.7.0",
   "homePage": "https://github.com/LeetHappyfeet/extension-MemoryVaultIngest",
   "auto_update": false
 }
