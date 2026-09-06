@@ -40,3 +40,12 @@ Current calls made by the extension:
 - `GET /memory?...` (fallback only)
 
 For chat ingestion, `character_id` is normalized from the active SillyTavern character name and `viewpoint_id` is set on character-authored messages so AIOS can preserve the character identity pivot separately from transport speaker metadata.
+
+
+## Session identity and diagnostics
+
+MemoryVaultIngest treats the active AIOS runtime identity as the combination of character, user, and SillyTavern conversation. Switching chats or groups resets the cached AIOS session/runtime instance so separate conversations are not merged accidentally.
+
+Browser-console diagnostics trace SillyTavern message events and each AIOS bridge stage (`session`, `ingest:user`, `activate`, `frame/text`, and `ingest:character`) without logging message bodies.
+
+Single-character chats are the supported path. Group-chat metadata is forwarded, but group speaker identity behavior is not yet considered fully validated.
