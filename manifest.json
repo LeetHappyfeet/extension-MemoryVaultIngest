@@ -6,8 +6,8 @@
   "generate_interceptor": "MemoryVaultIngest_Intercept",
   "js": "index.js",
   "css": "",
-  "author": "YourNameHere",
-  "version": "0.5.0",
-  "homePage": "https://github.com/your-org/MemoryVaultIngest",
+  "author": "LeetHappyfeet",
+  "version": "0.6.0",
+  "homePage": "https://github.com/LeetHappyfeet/extension-MemoryVaultIngest",
   "auto_update": false
 }
