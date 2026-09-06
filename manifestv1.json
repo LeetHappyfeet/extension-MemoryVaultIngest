@@ -1,0 +1,9 @@
+{
+  "display_name": "Memory Vault Ingest",
+  "loading_order": 5,
+  "js": "index.js",
+  "author": "Greenflame Labs",
+  "version": "0.1.0",
+  "homePage": "https://greenflame.tech",
+  "auto_update": false
+}

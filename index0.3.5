@@ -1,0 +1,89 @@
+/* MemoryVaultIngest v0.3.5 – guaranteed user + character recording
+ * Works with SillyTavern builds where event callbacks do NOT supply the
+ * message object. We fall back to ctx.chat[latest].
+ */
+
+import { eventSource, event_types } from "../../../../script.js";
+
+const API_ROOT   = "http://192.168.1.205:8000";
+const API_SESS   = `${API_ROOT}/session`;
+const API_INGEST = `${API_ROOT}/ingest`;
+
+const LISTEN_SENT     = event_types?.MESSAGE_SENT     ?? "message_sent";     // user line
+const LISTEN_RECEIVED = event_types?.MESSAGE_RECEIVED ?? "message_received"; // AI line
+
+let sessionId = null;
+let lastHash  = null;   // dedupe guard
+
+/* ------------------------------------------------------------------ */
+async function openSession(ctx) {
+  if (sessionId) return sessionId;
+  const topic = `${ctx.characterId ?? "chat"}-${Date.now()}`;
+  try {
+    const res = await fetch(API_SESS, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ topic }),
+    });
+    if (!res.ok) throw new Error(await res.text());
+    sessionId = (await res.json()).session_id;
+    console.debug("[MemoryVaultIngest] ↯ new session", sessionId);
+  } catch (err) {
+    console.error("[MemoryVaultIngest] ❌ session create failed", err);
+  }
+  return sessionId;
+}
+
+/* ------------------------------------------------------------------ */
+async function pushLine(evtName) {
+  const ctx = SillyTavern.getContext();
+  const msg = ctx.chat?.[ctx.chat.length - 1];
+  if (!msg || !msg.mes) return;
+
+  const hash = `${evtName}::${msg.mes}`;
+  if (hash === lastHash) return; // skip duplicate fires
+  lastHash = hash;
+
+  await openSession(ctx);
+
+  const speakerType = evtName === LISTEN_SENT ? "user" : "character";
+  const speakerId   = speakerType === "user" ? ctx.name1 : ctx.name2;
+  const recipientId = ctx.groupId ? null : speakerType === "user" ? ctx.name2 : ctx.name1;
+
+  const payload = {
+    session_id:   sessionId,
+    speaker_id:   speakerId,
+    speaker_type: speakerType,
+    recipient_id: recipientId,
+    character_id: String(ctx.characterId ?? ""),
+    user_name:    ctx.name1,
+    text:         msg.mes,
+  };
+
+  try {
+    const res = await fetch(API_INGEST, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) {
+      console.error(`[MemoryVaultIngest] ${res.status}:`, await res.text());
+    } else {
+      console.debug(`[MemoryVaultIngest] (${speakerType}) ✔ stored`, await res.json());
+    }
+  } catch (err) {
+    console.error("[MemoryVaultIngest] ❌ fetch failed", err);
+  }
+}
+
+/* ------------------------------------------------------------------ */
+console.log(`[MemoryVaultIngest] v0.3.4 loaded – listening on \"${LISTEN_SENT}\" & \"${LISTEN_RECEIVED}\"`);
+
+eventSource.on(LISTEN_SENT,     () => {
+  /* SillyTavern fires MESSAGE_SENT before the user's message is actually
+   * pushed into ctx.chat. Defer a tick so the array is updated. */
+  setTimeout(() => pushLine(LISTEN_SENT), 0);
+});
+
+eventSource.on(LISTEN_RECEIVED, () => pushLine(LISTEN_RECEIVED));
+eventSource.on(LISTEN_RECEIVED, () => pushLine(LISTEN_RECEIVED));
