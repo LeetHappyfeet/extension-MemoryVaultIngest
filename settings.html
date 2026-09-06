@@ -1,13 +1,37 @@
-{
-  "display_name": "MemoryVault Ingest",
-  "loading_order": 210,
-  "requires": [],
-  "optional": [],
-  "generate_interceptor": "MemoryVaultIngest_Intercept",
-  "js": "index.js",
-  "css": "",
-  "author": "YourNameHere",
-  "version": "0.5.0",
-  "homePage": "https://github.com/your-org/MemoryVaultIngest",
-  "auto_update": false
-}
+<div id="memoryvaultingest_container" class="extension-section">
+  <h3>MemoryVault Ingest</h3>
+  <label>
+    <input type="checkbox" id="mvi_enabled"> Enable AIOS prompt injection
+  </label>
+
+  <div style="margin-top:10px;">
+    <label for="mvi_api_root"><b>AIOS API Root:</b></label>
+    <input type="text" id="mvi_api_root" style="width:100%;" placeholder="http://192.168.1.217:8000">
+  </div>
+
+  <div style="margin-top:10px;">
+    <b>Injection Position:</b><br>
+    <label><input type="radio" name="mvi_position" value="0"> BEFORE_PROMPT</label><br>
+    <label><input type="radio" name="mvi_position" value="1"> IN_PROMPT</label><br>
+    <label><input type="radio" name="mvi_position" value="2"> AFTER_PROMPT</label>
+  </div>
+
+  <div style="margin-top:10px;">
+    <label for="mvi_depth"><b>Depth:</b></label>
+    <input type="number" id="mvi_depth" min="0" max="10" step="1">
+    <small>Attach near the latest message when using IN_PROMPT.</small>
+  </div>
+
+  <div style="margin-top:10px;">
+    <label for="mvi_recent_limit"><b>Recent event limit:</b></label>
+    <input type="number" id="mvi_recent_limit" min="1" max="50" step="1">
+  </div>
+
+  <div style="margin-top:10px;">
+    <label><input type="checkbox" id="mvi_tag"> Wrap returned AIOS prompt in &lt;aios_context&gt; tags</label>
+  </div>
+
+  <div style="margin-top:10px;">
+    <label><input type="checkbox" id="mvi_memory_fallback"> Fall back to legacy /memory if runtime frame is unavailable</label>
+  </div>
+</div>
