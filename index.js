@@ -1,4 +1,4 @@
-/* MemoryVaultIngest v0.7.0 – bounded AIOS HUD preparation + SillyTavern prompt bridge */
+/* MemoryVaultIngest v0.7.1 – early ingest + bounded AIOS HUD preparation */
 
 import {
   eventSource,
@@ -35,7 +35,6 @@ const defaultSettings = {
 };
 
 const LISTEN_SENT = event_types?.MESSAGE_SENT ?? "message_sent";
-const LISTEN_USER = event_types?.USER_MESSAGE_RENDERED ?? "user_message_rendered";
 const LISTEN_AI = event_types?.MESSAGE_RECEIVED ?? "message_received";
 const LISTEN_AI_RENDERED = event_types?.CHARACTER_MESSAGE_RENDERED ?? "character_message_rendered";
 
@@ -217,33 +216,54 @@ async function activateRuntime(ctx, options = {}) {
 
   await openSession(ctx, options);
 
-  try {
-    const json = await requestJson(
-      apiUrl(`/character/${encodeURIComponent(characterId)}/activate`),
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          user_name: userName,
-          session_id: sessionId,
-          scope_key: "conversation",
-          controller_type: "agent",
-          controller_ref: `sillytavern:${characterId}`,
-        }),
-        signal: options.signal,
-      },
-      Number(options.retries ?? settings().maxRetries ?? 1),
-      "activate",
-      options.timeoutMs,
-    );
+  const maxAttempts = Math.max(1, Number(options.activationAttempts ?? 3));
+  const retryDelay = Math.max(25, Number(options.activationRetryDelayMs ?? settings().retryDelayMs ?? 250));
 
-    instanceId = json.instance_id;
-    console.debug(`[${MODULE_NAME}] activated AIOS runtime instance ${instanceId}`);
-    return instanceId;
-  } catch (error) {
-    console.warn(`[${MODULE_NAME}] runtime activation unavailable:`, error);
-    return null;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    if (options.signal?.aborted) return null;
+
+    try {
+      const json = await requestJson(
+        apiUrl(`/character/${encodeURIComponent(characterId)}/activate`),
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            user_name: userName,
+            session_id: sessionId,
+            scope_key: "conversation",
+            controller_type: "agent",
+            controller_ref: `sillytavern:${characterId}`,
+          }),
+          signal: options.signal,
+        },
+        0,
+        `activate:${attempt}/${maxAttempts}`,
+        options.timeoutMs,
+      );
+
+      instanceId = json.instance_id;
+      console.debug(`[${MODULE_NAME}] activated AIOS runtime instance ${instanceId}`);
+      return instanceId;
+    } catch (error) {
+      const isNotFound = String(error?.message ?? "").startsWith("404 ");
+      if (!isNotFound || attempt >= maxAttempts || options.signal?.aborted) {
+        console.warn(`[${MODULE_NAME}] runtime activation unavailable:`, error);
+        return null;
+      }
+
+      console.debug(
+        `[${MODULE_NAME}] character runtime not registered yet; retrying activation ${attempt + 1}/${maxAttempts}`,
+      );
+
+      await Promise.race([
+        new Promise(resolve => setTimeout(resolve, retryDelay * attempt)),
+        new Promise(resolve => options.signal?.addEventListener("abort", () => resolve(null), { once: true })),
+      ]);
+    }
   }
+
+  return null;
 }
 
 function messageRole(message) {
@@ -353,6 +373,7 @@ function cachePreparedHud(json, nodeId) {
     freshness: cachedHudFreshness,
     chars: text.length,
   });
+  console.debug(`[${MODULE_NAME}] AIOS HUD prompt returned:\n${text}`);
   return text;
 }
 
@@ -403,7 +424,9 @@ async function fetchRuntimePrompt(ctx, options = {}) {
       "frame/text",
       options.timeoutMs,
     );
-    return typeof json?.text === "string" && json.text.trim() ? json.text.trim() : null;
+    const text = typeof json?.text === "string" && json.text.trim() ? json.text.trim() : null;
+    if (text) console.debug(`[${MODULE_NAME}] AIOS HUD prompt returned (frame/text):\n${text}`);
+    return text;
   } catch (error) {
     console.warn(`[${MODULE_NAME}] AIOS runtime frame fetch failed:`, error);
     return null;
@@ -554,21 +577,24 @@ window[`${MODULE_NAME}_Intercept`] = async function (_chat, _maxContext, abort, 
   }
 };
 
-eventSource.on(LISTEN_SENT, () => {
-  console.debug(`[${MODULE_NAME}] MESSAGE_SENT observed; waiting for user render`);
-  eventSource.once(LISTEN_USER, (messageId) => {
-    console.debug(`[${MODULE_NAME}] USER_MESSAGE_RENDERED observed`, { messageId });
-    const ctx = getContext();
-    pendingUserIngest = pushLine("user", messageId)
-      .then(json => {
-        latestUserNodeId = json?.node_id ?? null;
-        if (latestUserNodeId) startHudPrefetch(ctx, latestUserNodeId);
-        return json;
-      })
-      .finally(() => {
-        pendingUserIngest = null;
-      });
-  });
+eventSource.on(LISTEN_SENT, (messageId) => {
+  console.debug(`[${MODULE_NAME}] MESSAGE_SENT observed; starting non-blocking user ingest`, { messageId });
+  const ctx = getContext();
+
+  const ingestPromise = pushLine("user", messageId)
+    .then(json => {
+      latestUserNodeId = json?.node_id ?? null;
+      if (latestUserNodeId) startHudPrefetch(ctx, latestUserNodeId);
+      return json;
+    })
+    .finally(() => {
+      if (pendingUserIngest === ingestPromise) pendingUserIngest = null;
+    });
+
+  pendingUserIngest = ingestPromise;
+
+  // SillyTavern awaits MESSAGE_SENT listeners. Intentionally return immediately:
+  // the tracked promise is observed later by the bounded generation interceptor.
 });
 
 eventSource.on(LISTEN_AI, () => {
@@ -650,4 +676,4 @@ jQuery(async () => {
   console.log(`[${MODULE_NAME}] settings panel registered`);
 });
 
-console.log(`[${MODULE_NAME}] v0.7.0 loaded (bounded AIOS HUD prepare bridge)`);
+console.log(`[${MODULE_NAME}] v0.7.1 loaded (early ingest + bounded AIOS HUD prepare bridge)`);
