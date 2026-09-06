@@ -1,4 +1,4 @@
-/* MemoryVaultIngest v0.6.0 – AIOS chat ingest + runtime prompt bridge */
+/* MemoryVaultIngest v0.6.1 – chat-aware AIOS ingest + runtime prompt bridge */
 
 import {
   eventSource,
@@ -37,6 +37,7 @@ let sessionId = null;
 let instanceId = null;
 let activeCharacterId = null;
 let activeUserName = null;
+let activeConversationKey = null;
 let lastInjectionKey = null;
 
 function settings() {
@@ -60,43 +61,72 @@ function resetRuntimeIdentity() {
   instanceId = null;
   activeCharacterId = null;
   activeUserName = null;
+  activeConversationKey = null;
   lastInjectionKey = null;
+}
+
+function conversationKey(ctx) {
+  if (ctx?.groupId) return `group:${ctx.groupId}`;
+  if (ctx?.chatId !== undefined && ctx?.chatId !== null && String(ctx.chatId) !== "") {
+    return `chat:${ctx.chatId}`;
+  }
+  return "chat:unknown";
 }
 
 function currentIdentity(ctx) {
   return {
     characterId: normalizeCharId(ctx?.name2),
     userName: String(ctx?.name1 ?? "").trim(),
+    conversationKey: conversationKey(ctx),
   };
 }
 
 function ensureIdentityMatches(ctx) {
-  const { characterId, userName } = currentIdentity(ctx);
-  if (
+  const { characterId, userName, conversationKey: nextConversationKey } = currentIdentity(ctx);
+  const identityChanged =
     (activeCharacterId && activeCharacterId !== characterId) ||
-    (activeUserName && activeUserName !== userName)
-  ) {
-    console.debug(`[${MODULE_NAME}] character/user changed; resetting AIOS runtime identity`);
+    (activeUserName && activeUserName !== userName) ||
+    (activeConversationKey && activeConversationKey !== nextConversationKey);
+
+  if (identityChanged) {
+    console.debug(
+      `[${MODULE_NAME}] runtime identity changed; resetting AIOS session`,
+      {
+        character_id: characterId,
+        user_name: userName,
+        conversation: nextConversationKey,
+      },
+    );
     resetRuntimeIdentity();
   }
+
   activeCharacterId = characterId;
   activeUserName = userName;
+  activeConversationKey = nextConversationKey;
 }
 
-async function requestJson(url, options = {}, retries = 0) {
+async function requestJson(url, options = {}, retries = 0, label = "request") {
   const retryDelay = Number(settings().retryDelayMs ?? 500);
   let lastError = null;
+  const method = options?.method ?? "GET";
 
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
+      console.debug(
+        `[${MODULE_NAME}] AIOS -> ${label} (${method}) attempt ${attempt + 1}/${retries + 1}`,
+        url,
+      );
       const response = await fetch(url, options);
       if (!response.ok) {
         const body = await response.text();
         throw new Error(`${response.status} ${response.statusText}: ${body}`);
       }
-      return await response.json();
+      const json = await response.json();
+      console.debug(`[${MODULE_NAME}] AIOS <- ${label} ${response.status}`);
+      return json;
     } catch (error) {
       lastError = error;
+      console.warn(`[${MODULE_NAME}] AIOS !! ${label} failed:`, error);
       if (attempt < retries) {
         await new Promise(resolve => setTimeout(resolve, retryDelay));
       }
@@ -110,11 +140,11 @@ async function openSession(ctx) {
   ensureIdentityMatches(ctx);
   if (sessionId) return sessionId;
 
-  const { characterId, userName } = currentIdentity(ctx);
+  const { characterId, userName, conversationKey: sourceSessionId } = currentIdentity(ctx);
   const payload = {
     topic: `${characterId || "chat"}-${Date.now()}`,
     source: "SillyTavern",
-    source_session_id: String(ctx?.chatId ?? ctx?.groupId ?? ""),
+    source_session_id: sourceSessionId,
     meta: {
       character_id: characterId,
       user_name: userName,
@@ -126,7 +156,7 @@ async function openSession(ctx) {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
-  });
+  }, 0, "session");
 
   sessionId = json.session_id;
   console.debug(`[${MODULE_NAME}] opened AIOS session ${sessionId}`);
@@ -157,6 +187,7 @@ async function activateRuntime(ctx) {
         }),
       },
       Number(settings().maxRetries ?? 2),
+      "activate",
     );
 
     instanceId = json.instance_id;
@@ -214,7 +245,7 @@ async function pushLine(speakerType) {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
-    });
+    }, Number(settings().maxRetries ?? 2), `ingest:${speakerType}`);
 
     console.debug(`[${MODULE_NAME}] ingested ${speakerType}:`, json);
   } catch (error) {
@@ -232,6 +263,7 @@ async function fetchRuntimePrompt(ctx) {
       apiUrl(`/instance/${encodeURIComponent(runtimeId)}/frame/text?recent_limit=${recentLimit}`),
       { method: "GET" },
       Number(settings().maxRetries ?? 2),
+      "frame/text",
     );
     return typeof json?.text === "string" && json.text.trim() ? json.text.trim() : null;
   } catch (error) {
@@ -255,7 +287,12 @@ async function fetchLegacyMemoryPrompt(ctx) {
   );
 
   try {
-    const json = await requestJson(url, { method: "GET" }, Number(settings().maxRetries ?? 2));
+    const json = await requestJson(
+      url,
+      { method: "GET" },
+      Number(settings().maxRetries ?? 2),
+      "memory-fallback",
+    );
     const chunks = (json?.vector_matches ?? []).map(match => match?.content).filter(Boolean);
     return chunks.length ? chunks.join("\n---\n") : null;
   } catch (error) {
@@ -271,6 +308,7 @@ async function buildAiosPrompt(ctx) {
 }
 
 window[`${MODULE_NAME}_Intercept`] = async function (_chat, _maxContext, _abort, type) {
+  console.debug(`[${MODULE_NAME}] interceptor fired`, { type });
   if (type === "quiet") return;
 
   const s = settings();
@@ -315,13 +353,17 @@ window[`${MODULE_NAME}_Intercept`] = async function (_chat, _maxContext, _abort,
 };
 
 eventSource.on(LISTEN_SENT, () => {
+  console.debug(`[${MODULE_NAME}] MESSAGE_SENT observed; waiting for user render`);
   eventSource.once(LISTEN_USER, async () => {
+    console.debug(`[${MODULE_NAME}] USER_MESSAGE_RENDERED observed`);
     await pushLine("user");
   });
 });
 
 eventSource.on(LISTEN_AI, () => {
+  console.debug(`[${MODULE_NAME}] MESSAGE_RECEIVED observed; waiting for character render`);
   eventSource.once(LISTEN_AI_RENDERED, async () => {
+    console.debug(`[${MODULE_NAME}] CHARACTER_MESSAGE_RENDERED observed`);
     await pushLine("character");
   });
 });
@@ -372,4 +414,4 @@ jQuery(async () => {
   console.log(`[${MODULE_NAME}] settings panel registered`);
 });
 
-console.log(`[${MODULE_NAME}] v0.6.0 loaded (AIOS ingest + runtime prompt bridge)`);
+console.log(`[${MODULE_NAME}] v0.6.1 loaded (chat-aware AIOS ingest + runtime prompt bridge)`);
