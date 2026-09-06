@@ -5,12 +5,12 @@ import {
   event_types,
   setExtensionPrompt,
   extension_prompt_types,
+  saveSettingsDebounced,
 } from "../../../../script.js";
 import {
   getContext,
   extension_settings,
   renderExtensionTemplateAsync,
-  saveSettingsDebounced,
 } from "../../../extensions.js";
 
 const MODULE_NAME = "MemoryVaultIngest";
