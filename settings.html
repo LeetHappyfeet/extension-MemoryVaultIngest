@@ -1,7 +1,7 @@
 <div id="memoryvaultingest_container" class="extension-section">
   <h3>MemoryVault Ingest</h3>
   <label>
-    <input type="checkbox" id="mvi_enabled"> Enable AIOS prompt injection
+    <input type="checkbox" id="mvi_enabled"> Enable AIOS HUD prompt injection
   </label>
 
   <div style="margin-top:10px;">
@@ -28,10 +28,36 @@
   </div>
 
   <div style="margin-top:10px;">
-    <label><input type="checkbox" id="mvi_tag"> Wrap returned AIOS prompt in &lt;aios_context&gt; tags</label>
+    <label for="mvi_token_budget"><b>HUD token budget:</b></label>
+    <input type="number" id="mvi_token_budget" min="256" max="32000" step="256">
+    <small>Passed to AIOS so the HUD assembler decides what fits.</small>
   </div>
 
   <div style="margin-top:10px;">
-    <label><input type="checkbox" id="mvi_memory_fallback"> Fall back to legacy /memory if runtime frame is unavailable</label>
+    <label for="mvi_prepare_wait"><b>AIOS prepare wait (ms):</b></label>
+    <input type="number" id="mvi_prepare_wait" min="0" max="10000" step="100">
+    <small>Used by background HUD preparation after user ingest.</small>
+  </div>
+
+  <div style="margin-top:10px;">
+    <label for="mvi_generation_budget"><b>Generation wait budget (ms):</b></label>
+    <input type="number" id="mvi_generation_budget" min="50" max="5000" step="50">
+    <small>Hard cap on how long MemoryVaultIngest may delay SillyTavern generation. The plugin fails open when the budget expires.</small>
+  </div>
+
+  <div style="margin-top:10px;">
+    <label><input type="checkbox" id="mvi_require_ready"> Require AIOS generation-ready HUD before treating a fresh frame as authoritative</label>
+  </div>
+
+  <div style="margin-top:10px;">
+    <label><input type="checkbox" id="mvi_cached_hud"> Use the most recent prepared HUD when fresh retrieval misses the generation deadline</label>
+  </div>
+
+  <div style="margin-top:10px;">
+    <label><input type="checkbox" id="mvi_tag"> Wrap returned AIOS prompt in &lt;aios_hud&gt; tags</label>
+  </div>
+
+  <div style="margin-top:10px;">
+    <label><input type="checkbox" id="mvi_memory_fallback"> Fall back to legacy /memory if runtime HUD retrieval is unavailable</label>
   </div>
 </div>
