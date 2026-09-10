@@ -1,4 +1,4 @@
-/* MemoryVaultIngest v0.8.0 – AIOS live HUD bridge and transcript reconciliation */
+/* MemoryVaultIngest v0.8.1 – AIOS live HUD bridge and transcript reconciliation */
 
 import {
   eventSource,
@@ -55,6 +55,9 @@ let reconciliationPromise = null;
 let reconciliationGeneration = 0;
 let bridgeState = "DISCONNECTED";
 let hudCache = null;
+let connectionState = "UNKNOWN";
+let connectionDetail = "Not tested";
+let connectionProbeTimer = null;
 
 function settings() {
   if (!extension_settings[MODULE_NAME]) {
@@ -68,6 +71,39 @@ function settings() {
   return extension_settings[MODULE_NAME];
 }
 
+function normalizeApiRoot(value) {
+  let root = String(value ?? "").trim();
+  if (!root) root = DEFAULT_API_ROOT;
+  if (!/^https?:\/\//i.test(root)) root = `http://${root}`;
+  const parsed = new URL(root);
+  if (!/^https?:$/.test(parsed.protocol)) throw new Error("AIOS URL must use http:// or https://");
+  return root.replace(/\/+$/, "");
+}
+
+function renderConnectionState(state = connectionState, detail = connectionDetail) {
+  const dot = document.getElementById("mvi_connection_dot");
+  const label = document.getElementById("mvi_connection_status");
+  const detailNode = document.getElementById("mvi_connection_detail");
+  if (!dot || !label) return;
+
+  const palette = {
+    CONNECTED: "#49c26b",
+    CONNECTING: "#e6b94f",
+    DISCONNECTED: "#e05a5a",
+    UNKNOWN: "#8b8b8b",
+  };
+  dot.style.background = palette[state] ?? palette.UNKNOWN;
+  dot.style.boxShadow = `0 0 7px ${palette[state] ?? palette.UNKNOWN}`;
+  label.textContent = state === "CONNECTED" ? "Connected" : state === "CONNECTING" ? "Connecting…" : state === "DISCONNECTED" ? "Disconnected" : "Not tested";
+  if (detailNode) detailNode.textContent = detail || "";
+}
+
+function setConnectionState(state, detail = "") {
+  connectionState = state;
+  connectionDetail = detail;
+  renderConnectionState();
+}
+
 function setBridgeState(next, detail = null) {
   if (bridgeState === next && !detail) return;
   bridgeState = next;
@@ -79,8 +115,7 @@ function normalizeCharId(name) {
 }
 
 function apiUrl(path) {
-  const root = String(settings().apiRoot || DEFAULT_API_ROOT).replace(/\/+$/, "");
-  return `${root}${path}`;
+  return `${normalizeApiRoot(settings().apiRoot || DEFAULT_API_ROOT)}${path}`;
 }
 
 function clearHudCache() {
@@ -171,12 +206,14 @@ async function requestJson(url, options = {}, retries = 0, label = "request", ti
         throw error;
       }
       const json = await response.json();
+      setConnectionState("CONNECTED", normalizeApiRoot(settings().apiRoot));
       console.debug(`[${MODULE_NAME}] AIOS <- ${label} ${response.status}`);
       return json;
     } catch (error) {
       lastError = error;
       const aborted = bounded.signal.aborted || error?.name === "AbortError" || error?.name === "TimeoutError";
       console.warn(`[${MODULE_NAME}] AIOS !! ${label} failed:`, error);
+      if (!options?.signal?.aborted) setConnectionState("DISCONNECTED", String(error?.message ?? "Connection failed"));
       if (aborted) break;
       if (attempt < retries) await new Promise(resolve => setTimeout(resolve, retryDelay));
     } finally {
@@ -184,6 +221,40 @@ async function requestJson(url, options = {}, retries = 0, label = "request", ti
     }
   }
   throw lastError;
+}
+
+async function probeConnection(options = {}) {
+  const timeoutMs = Math.max(250, Number(options.timeoutMs ?? settings().requestTimeoutMs ?? 1800));
+  let root;
+  try {
+    root = normalizeApiRoot(options.apiRoot ?? settings().apiRoot);
+  } catch (error) {
+    setConnectionState("DISCONNECTED", error.message);
+    return false;
+  }
+
+  setConnectionState("CONNECTING", root);
+  const bounded = timeoutSignal(timeoutMs);
+  try {
+    const response = await fetch(`${root}/healthz`, { method: "GET", signal: bounded.signal, cache: "no-store" });
+    if (!response.ok) throw new Error(`Health check returned HTTP ${response.status}`);
+    setConnectionState("CONNECTED", root);
+    console.debug(`[${MODULE_NAME}] AIOS health check OK`, root);
+    return true;
+  } catch (error) {
+    setConnectionState("DISCONNECTED", `${root} — ${error?.message ?? "unreachable"}`);
+    console.warn(`[${MODULE_NAME}] AIOS health check failed`, error);
+    return false;
+  } finally {
+    bounded.cleanup();
+  }
+}
+
+function startConnectionMonitor() {
+  if (connectionProbeTimer) clearInterval(connectionProbeTimer);
+  connectionProbeTimer = setInterval(() => {
+    if (settings().enabled) void probeConnection({ timeoutMs: 1200 });
+  }, 15000);
 }
 
 async function openSession(ctx, options = {}) {
@@ -594,17 +665,43 @@ jQuery(async () => {
   const s = settings();
   const html = await renderExtensionTemplateAsync("third-party/MemoryVaultIngest", "settings");
   $(document.getElementById("extensions_settings2")).append(html);
+
+  const apiRootInput = $("#mvi_api_root");
+  apiRootInput.val(s.apiRoot || DEFAULT_API_ROOT);
+  renderConnectionState();
+
+  $("#mvi_connect").on("click", async () => {
+    let root;
+    try {
+      root = normalizeApiRoot(apiRootInput.val());
+    } catch (error) {
+      setConnectionState("DISCONNECTED", error.message);
+      return;
+    }
+    apiRootInput.val(root);
+    s.apiRoot = root;
+    resetRuntimeIdentity();
+    saveSettingsDebounced();
+    const connected = await probeConnection({ apiRoot: root });
+    if (connected && s.enabled) void reconcileConversation(getContext());
+  });
+
+  apiRootInput.on("keydown", event => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      $("#mvi_connect").trigger("click");
+    }
+  });
+
   $("#mvi_enabled").prop("checked", s.enabled).on("change", () => {
     s.enabled = !!$("#mvi_enabled").prop("checked");
     saveSettingsDebounced();
-    if (s.enabled) void reconcileConversation(getContext());
-    else injectPrompt(getContext(), null);
-  });
-  $("#mvi_api_root").val(s.apiRoot || DEFAULT_API_ROOT).on("change", () => {
-    s.apiRoot = String($("#mvi_api_root").val() || DEFAULT_API_ROOT).trim();
-    resetRuntimeIdentity();
-    saveSettingsDebounced();
-    void reconcileConversation(getContext());
+    if (s.enabled) {
+      void probeConnection();
+      void reconcileConversation(getContext());
+    } else {
+      injectPrompt(getContext(), null);
+    }
   });
   $(`input[name="mvi_position"][value="${s.position}"]`).prop("checked", true);
   $("input[name='mvi_position']").on("change", () => { s.position = Number($("input[name='mvi_position']:checked").val()); saveSettingsDebounced(); });
@@ -618,8 +715,13 @@ jQuery(async () => {
   $("#mvi_tag").prop("checked", s.tagWrapper).on("change", () => { s.tagWrapper = !!$("#mvi_tag").prop("checked"); saveSettingsDebounced(); });
   $("#mvi_reconcile").prop("checked", s.reconcileOnChatLoad).on("change", () => { s.reconcileOnChatLoad = !!$("#mvi_reconcile").prop("checked"); saveSettingsDebounced(); if (s.reconcileOnChatLoad) void reconcileConversation(getContext()); });
   $("#mvi_log_hud").prop("checked", s.logHudText).on("change", () => { s.logHudText = !!$("#mvi_log_hud").prop("checked"); saveSettingsDebounced(); });
+
   console.log(`[${MODULE_NAME}] settings panel registered`);
-  queueMicrotask(() => void reconcileConversation(getContext()));
+  startConnectionMonitor();
+  queueMicrotask(async () => {
+    await probeConnection();
+    void reconcileConversation(getContext());
+  });
 });
 
-console.log(`[${MODULE_NAME}] v0.8.0 loaded (canonical AIOS HUD bridge + transcript reconciliation)`);
+console.log(`[${MODULE_NAME}] v0.8.1 loaded (canonical AIOS HUD bridge + connection monitor)`);
