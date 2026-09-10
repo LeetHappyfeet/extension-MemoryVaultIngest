@@ -34,9 +34,9 @@
   </div>
 
   <div style="margin-top:10px;">
-    <label for="mvi_prepare_wait"><b>AIOS prepare wait (ms):</b></label>
+    <label for="mvi_prepare_wait"><b>AIOS HUD wait (ms):</b></label>
     <input type="number" id="mvi_prepare_wait" min="0" max="10000" step="100">
-    <small>Used by background HUD preparation after user ingest.</small>
+    <small>Used by background HUD preparation after ingest and transcript reconciliation.</small>
   </div>
 
   <div style="margin-top:10px;">
@@ -46,11 +46,19 @@
   </div>
 
   <div style="margin-top:10px;">
-    <label><input type="checkbox" id="mvi_require_ready"> Require AIOS generation-ready HUD before treating a fresh frame as authoritative</label>
+    <label><input type="checkbox" id="mvi_require_ready"> Require an AIOS generation-ready HUD before treating a fresh frame as authoritative</label>
   </div>
 
   <div style="margin-top:10px;">
-    <label><input type="checkbox" id="mvi_cached_hud"> Use the most recent prepared HUD when fresh retrieval misses the generation deadline</label>
+    <label><input type="checkbox" id="mvi_cached_hud"> Use the most recent compatible HUD when an exact fresh HUD misses the generation deadline</label>
+  </div>
+
+  <div style="margin-top:10px;">
+    <label><input type="checkbox" id="mvi_reconcile"> Reconcile the active SillyTavern transcript with AIOS when a chat is loaded or changed</label>
+  </div>
+
+  <div style="margin-top:10px;">
+    <label><input type="checkbox" id="mvi_log_hud"> Log returned HUD text in the browser console</label>
   </div>
 
   <div style="margin-top:10px;">
@@ -58,6 +66,6 @@
   </div>
 
   <div style="margin-top:10px;">
-    <label><input type="checkbox" id="mvi_memory_fallback"> Fall back to legacy /memory if runtime HUD retrieval is unavailable</label>
+    <small>Live generation uses only the canonical <code>POST /instance/{id}/hud</code> endpoint. Legacy <code>/frame/text</code> and <code>/memory</code> fallbacks are intentionally disabled.</small>
   </div>
 </div>
