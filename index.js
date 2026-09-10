@@ -1,4 +1,4 @@
-/* MemoryVaultIngest v0.7.2 – source-branch aware HUD preparation */
+/* MemoryVaultIngest v0.8.0 – AIOS live HUD bridge and transcript reconciliation */
 
 import {
   eventSource,
@@ -31,12 +31,16 @@ const defaultSettings = {
   requireGenerationReady: true,
   useCachedHud: true,
   tagWrapper: true,
-  memoryFallback: true,
+  reconcileOnChatLoad: true,
+  logHudText: true,
 };
 
 const LISTEN_SENT = event_types?.MESSAGE_SENT ?? "message_sent";
 const LISTEN_AI = event_types?.MESSAGE_RECEIVED ?? "message_received";
 const LISTEN_AI_RENDERED = event_types?.CHARACTER_MESSAGE_RENDERED ?? "character_message_rendered";
+const LISTEN_CHAT_CHANGED = event_types?.CHAT_CHANGED ?? "chat_changed";
+const LISTEN_MESSAGE_UPDATED = event_types?.MESSAGE_UPDATED ?? "message_updated";
+const LISTEN_MESSAGE_SWIPED = event_types?.MESSAGE_SWIPED ?? "message_swiped";
 
 let sessionId = null;
 let instanceId = null;
@@ -45,23 +49,29 @@ let activeUserName = null;
 let activeConversationKey = null;
 let lastInjectionKey = null;
 let pendingUserIngest = null;
-let latestUserNodeId = null;
-let latestPreparedNodeId = null;
-let cachedHudText = null;
-let cachedHudFreshness = null;
+let latestSourceNodeId = null;
 let prefetchPromise = null;
+let reconciliationPromise = null;
+let reconciliationGeneration = 0;
+let bridgeState = "DISCONNECTED";
+let hudCache = null;
 
 function settings() {
   if (!extension_settings[MODULE_NAME]) {
     extension_settings[MODULE_NAME] = structuredClone(defaultSettings);
   } else {
     for (const [key, value] of Object.entries(defaultSettings)) {
-      if (extension_settings[MODULE_NAME][key] === undefined) {
-        extension_settings[MODULE_NAME][key] = value;
-      }
+      if (extension_settings[MODULE_NAME][key] === undefined) extension_settings[MODULE_NAME][key] = value;
     }
+    delete extension_settings[MODULE_NAME].memoryFallback;
   }
   return extension_settings[MODULE_NAME];
+}
+
+function setBridgeState(next, detail = null) {
+  if (bridgeState === next && !detail) return;
+  bridgeState = next;
+  console.debug(`[${MODULE_NAME}] state -> ${next}`, detail ?? "");
 }
 
 function normalizeCharId(name) {
@@ -73,26 +83,29 @@ function apiUrl(path) {
   return `${root}${path}`;
 }
 
+function clearHudCache() {
+  hudCache = null;
+  lastInjectionKey = null;
+}
+
 function resetRuntimeIdentity() {
   sessionId = null;
   instanceId = null;
   activeCharacterId = null;
   activeUserName = null;
   activeConversationKey = null;
-  lastInjectionKey = null;
   pendingUserIngest = null;
-  latestUserNodeId = null;
-  latestPreparedNodeId = null;
-  cachedHudText = null;
-  cachedHudFreshness = null;
+  latestSourceNodeId = null;
   prefetchPromise = null;
+  reconciliationPromise = null;
+  reconciliationGeneration += 1;
+  clearHudCache();
+  setBridgeState("DISCONNECTED");
 }
 
 function conversationKey(ctx) {
   if (ctx?.groupId) return `group:${ctx.groupId}`;
-  if (ctx?.chatId !== undefined && ctx?.chatId !== null && String(ctx.chatId) !== "") {
-    return `chat:${ctx.chatId}`;
-  }
+  if (ctx?.chatId !== undefined && ctx?.chatId !== null && String(ctx.chatId) !== "") return `chat:${ctx.chatId}`;
   return "chat:unknown";
 }
 
@@ -106,20 +119,18 @@ function currentIdentity(ctx) {
 
 function ensureIdentityMatches(ctx) {
   const { characterId, userName, conversationKey: nextConversationKey } = currentIdentity(ctx);
-  const identityChanged =
+  const changed =
     (activeCharacterId && activeCharacterId !== characterId) ||
     (activeUserName && activeUserName !== userName) ||
     (activeConversationKey && activeConversationKey !== nextConversationKey);
-
-  if (identityChanged) {
-    console.debug(`[${MODULE_NAME}] runtime identity changed; resetting AIOS session`, {
+  if (changed) {
+    console.debug(`[${MODULE_NAME}] runtime identity changed; resetting AIOS bridge`, {
       character_id: characterId,
       user_name: userName,
       conversation: nextConversationKey,
     });
     resetRuntimeIdentity();
   }
-
   activeCharacterId = characterId;
   activeUserName = userName;
   activeConversationKey = nextConversationKey;
@@ -127,15 +138,12 @@ function ensureIdentityMatches(ctx) {
 
 function timeoutSignal(timeoutMs, parentSignal = null) {
   const controller = new AbortController();
-  const timeout = Math.max(1, Number(timeoutMs || 1));
-  const timer = setTimeout(() => controller.abort(new DOMException("AIOS request timed out", "TimeoutError")), timeout);
-
+  const timer = setTimeout(() => controller.abort(new DOMException("AIOS request timed out", "TimeoutError")), Math.max(1, Number(timeoutMs || 1)));
   const forwardAbort = () => controller.abort(parentSignal?.reason ?? new DOMException("Aborted", "AbortError"));
   if (parentSignal) {
     if (parentSignal.aborted) forwardAbort();
     else parentSignal.addEventListener("abort", forwardAbort, { once: true });
   }
-
   return {
     signal: controller.signal,
     cleanup() {
@@ -150,7 +158,6 @@ async function requestJson(url, options = {}, retries = 0, label = "request", ti
   const requestTimeout = Math.max(50, Number(timeoutMs ?? settings().requestTimeoutMs ?? 1800));
   let lastError = null;
   const method = options?.method ?? "GET";
-
   for (let attempt = 0; attempt <= retries; attempt++) {
     const bounded = timeoutSignal(requestTimeout, options?.signal ?? null);
     try {
@@ -158,7 +165,10 @@ async function requestJson(url, options = {}, retries = 0, label = "request", ti
       const response = await fetch(url, { ...options, signal: bounded.signal });
       if (!response.ok) {
         const body = await response.text();
-        throw new Error(`${response.status} ${response.statusText}: ${body}`);
+        const error = new Error(`${response.status} ${response.statusText}: ${body}`);
+        error.status = response.status;
+        error.body = body;
+        throw error;
       }
       const json = await response.json();
       console.debug(`[${MODULE_NAME}] AIOS <- ${label} ${response.status}`);
@@ -168,60 +178,49 @@ async function requestJson(url, options = {}, retries = 0, label = "request", ti
       const aborted = bounded.signal.aborted || error?.name === "AbortError" || error?.name === "TimeoutError";
       console.warn(`[${MODULE_NAME}] AIOS !! ${label} failed:`, error);
       if (aborted) break;
-      if (attempt < retries) {
-        await new Promise(resolve => setTimeout(resolve, retryDelay));
-      }
+      if (attempt < retries) await new Promise(resolve => setTimeout(resolve, retryDelay));
     } finally {
       bounded.cleanup();
     }
   }
-
   throw lastError;
 }
 
 async function openSession(ctx, options = {}) {
   ensureIdentityMatches(ctx);
   if (sessionId) return sessionId;
-
   const { characterId, userName, conversationKey: sourceSessionId } = currentIdentity(ctx);
-  const payload = {
-    topic: `${characterId || "chat"}-${Date.now()}`,
-    source: "SillyTavern",
-    source_session_id: sourceSessionId,
-    meta: {
-      character_id: characterId,
-      user_name: userName,
-      group_id: ctx?.groupId ?? null,
-    },
-  };
-
   const json = await requestJson(apiUrl("/session"), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
+    body: JSON.stringify({
+      topic: `${characterId || "chat"}-${sourceSessionId}`,
+      source: "SillyTavern",
+      source_session_id: sourceSessionId,
+      meta: {
+        character_id: characterId,
+        user_name: userName,
+        chat_id: ctx?.chatId ?? null,
+        group_id: ctx?.groupId ?? null,
+      },
+    }),
     signal: options.signal,
   }, 0, "session", options.timeoutMs);
-
   sessionId = json.session_id;
-  console.debug(`[${MODULE_NAME}] opened AIOS session ${sessionId}`);
+  setBridgeState("SESSION_RESOLVED", { session_id: sessionId, source_session_id: sourceSessionId });
   return sessionId;
 }
 
 async function activateRuntime(ctx, options = {}) {
   ensureIdentityMatches(ctx);
   if (instanceId) return instanceId;
-
   const { characterId, userName } = currentIdentity(ctx);
   if (!characterId || !userName) return null;
-
   await openSession(ctx, options);
-
   const maxAttempts = Math.max(1, Number(options.activationAttempts ?? 3));
   const retryDelay = Math.max(25, Number(options.activationRetryDelayMs ?? settings().retryDelayMs ?? 250));
-
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     if (options.signal?.aborted) return null;
-
     try {
       const json = await requestJson(
         apiUrl(`/character/${encodeURIComponent(characterId)}/activate`),
@@ -241,36 +240,29 @@ async function activateRuntime(ctx, options = {}) {
         `activate:${attempt}/${maxAttempts}`,
         options.timeoutMs,
       );
-
       instanceId = json.instance_id;
-      console.debug(`[${MODULE_NAME}] activated AIOS runtime instance ${instanceId}`);
+      setBridgeState("RUNTIME_ACTIVE", { instance_id: instanceId });
       return instanceId;
     } catch (error) {
-      const isNotFound = String(error?.message ?? "").startsWith("404 ");
-      if (!isNotFound || attempt >= maxAttempts || options.signal?.aborted) {
+      const notFound = error?.status === 404 || String(error?.message ?? "").startsWith("404 ");
+      if (!notFound || attempt >= maxAttempts || options.signal?.aborted) {
         console.warn(`[${MODULE_NAME}] runtime activation unavailable:`, error);
+        setBridgeState("DEGRADED", { reason: "runtime_activation" });
         return null;
       }
-
-      console.debug(
-        `[${MODULE_NAME}] character runtime not registered yet; retrying activation ${attempt + 1}/${maxAttempts}`,
-      );
-
       await Promise.race([
         new Promise(resolve => setTimeout(resolve, retryDelay * attempt)),
         new Promise(resolve => options.signal?.addEventListener("abort", () => resolve(null), { once: true })),
       ]);
     }
   }
-
   return null;
 }
 
 function messageRole(message) {
   const isSystem = Boolean(message?.is_system);
   const isUser = !isSystem && Boolean(message?.is_user || message?.sender === "user");
-  const isCharacter = !isSystem && !isUser;
-  return { isSystem, isUser, isCharacter };
+  return { isSystem, isUser, isCharacter: !isSystem && !isUser };
 }
 
 function latestMessage(ctx, speakerType) {
@@ -282,52 +274,26 @@ function latestMessage(ctx, speakerType) {
 
 function messageById(ctx, messageId) {
   if (messageId === undefined || messageId === null || messageId === "") return null;
-  return ctx?.chat?.[messageId] ?? null;
+  return ctx?.chat?.[Number(messageId)] ?? null;
 }
 
-async function pushLine(speakerType, messageId = null) {
-  const ctx = getContext();
+async function ingestMessage(ctx, messageId, msg, options = {}) {
+  if (!msg?.mes || msg.is_system) return null;
   ensureIdentityMatches(ctx);
-
-  let msg = messageById(ctx, messageId);
-  let usedFallback = false;
-
-  if (msg) {
-    const { isUser, isCharacter } = messageRole(msg);
-    const roleMatches = speakerType === "user" ? isUser : isCharacter;
-    if (!roleMatches) {
-      console.warn(`[${MODULE_NAME}] event message ${String(messageId)} did not match ${speakerType}; falling back`);
-      msg = null;
-    }
-  }
-
-  if (!msg) {
-    msg = latestMessage(ctx, speakerType);
-    usedFallback = true;
-  }
-
-  if (!msg?.mes) {
-    console.warn(`[${MODULE_NAME}] no message found for ${speakerType}`, { messageId });
-    return null;
-  }
-
-  if (usedFallback && messageId !== null && messageId !== undefined) {
-    console.debug(`[${MODULE_NAME}] used latest-message fallback for ${speakerType}`, { messageId });
-  }
-
-  try {
-    await openSession(ctx);
-
-    const { characterId, userName } = currentIdentity(ctx);
-    const speakerId = speakerType === "user" ? ctx.name1 : ctx.name2;
-    const recipientId = ctx.groupId ? null : (speakerType === "user" ? ctx.name2 : ctx.name1);
-
-    const payload = {
+  await openSession(ctx, options);
+  const { isUser, isCharacter } = messageRole(msg);
+  if (!isUser && !isCharacter) return null;
+  const speakerType = isUser ? "user" : "character";
+  const { characterId, userName } = currentIdentity(ctx);
+  const json = await requestJson(apiUrl("/ingest"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
       session_id: sessionId,
-      speaker_id: speakerId,
+      speaker_id: isUser ? ctx.name1 : ctx.name2,
       speaker_type: speakerType,
-      recipient_id: recipientId,
-      viewpoint_id: speakerType === "character" ? characterId : null,
+      recipient_id: ctx.groupId ? null : (isUser ? ctx.name2 : ctx.name1),
+      viewpoint_id: isCharacter ? characterId : null,
       character_id: characterId,
       user_name: userName,
       text: msg.mes,
@@ -337,18 +303,32 @@ async function pushLine(speakerType, messageId = null) {
         source: "SillyTavern",
         chat_id: ctx?.chatId ?? null,
         group_id: ctx?.groupId ?? null,
-        message_id: messageId ?? null,
+        message_id: Number(messageId),
+        swipe_id: msg?.swipe_id ?? msg?.swipeId ?? null,
       },
-    };
+    }),
+    signal: options.signal,
+  }, Number(options.retries ?? settings().maxRetries ?? 1), `ingest:${speakerType}:${messageId}`, options.timeoutMs);
+  latestSourceNodeId = json?.node_id ?? latestSourceNodeId;
+  console.debug(`[${MODULE_NAME}] ingested source slot ${messageId}`, { speaker_type: speakerType, node_id: json?.node_id ?? null });
+  return json;
+}
 
-    const json = await requestJson(apiUrl("/ingest"), {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    }, Number(settings().maxRetries ?? 1), `ingest:${speakerType}`);
-
-    console.debug(`[${MODULE_NAME}] ingested ${speakerType}:`, json);
-    return json;
+async function pushLine(speakerType, messageId = null) {
+  const ctx = getContext();
+  ensureIdentityMatches(ctx);
+  let msg = messageById(ctx, messageId);
+  if (msg) {
+    const role = messageRole(msg);
+    if ((speakerType === "user" && !role.isUser) || (speakerType === "character" && !role.isCharacter)) msg = null;
+  }
+  if (!msg) msg = latestMessage(ctx, speakerType);
+  if (!msg?.mes) return null;
+  let resolvedMessageId = messageId;
+  if (resolvedMessageId === null || resolvedMessageId === undefined || !messageById(ctx, resolvedMessageId)) resolvedMessageId = (ctx?.chat ?? []).indexOf(msg);
+  if (resolvedMessageId < 0) return null;
+  try {
+    return await ingestMessage(ctx, resolvedMessageId, msg);
   } catch (error) {
     console.error(`[${MODULE_NAME}] ingest failed:`, error);
     return null;
@@ -361,106 +341,68 @@ function formatHudText(text) {
   return `<aios_hud>\nThe following is AIOS runtime context for the active character. Treat it as current character/world state and retrieved knowledge, not as dialogue spoken by the user.\n\n${text}\n</aios_hud>`;
 }
 
-function cachePreparedHud(json, nodeId) {
+function cacheHud(json, requestedNodeId) {
   const text = typeof json?.text === "string" ? json.text.trim() : "";
   if (!text) return null;
-  cachedHudText = text;
-  cachedHudFreshness = json?.freshness ?? null;
-  latestPreparedNodeId = nodeId ?? json?.freshness?.requested_source_node_id ?? null;
+  hudCache = {
+    sessionId,
+    instanceId,
+    conversationKey: activeConversationKey,
+    requestedNodeId: requestedNodeId ?? json?.freshness?.requested_source_node_id ?? null,
+    sourceTimelineId: json?.freshness?.source_timeline_id ?? json?.frame?.source_timeline_id ?? null,
+    sourceHeadNodeId: json?.freshness?.source_head_node_id ?? json?.freshness?.current_source_head_node_id ?? null,
+    generationReady: Boolean(json?.generation_ready),
+    freshness: json?.freshness ?? null,
+    frame: json?.frame ?? null,
+    text,
+    preparedAt: Date.now(),
+  };
   console.debug(`[${MODULE_NAME}] cached AIOS HUD`, {
-    generation_ready: json?.generation_ready,
-    requested_node: latestPreparedNodeId,
-    freshness: cachedHudFreshness,
+    generation_ready: hudCache.generationReady,
+    requested_node: hudCache.requestedNodeId,
+    source_head_node: hudCache.sourceHeadNodeId,
+    freshness: hudCache.freshness,
     chars: text.length,
   });
-  console.debug(`[${MODULE_NAME}] AIOS HUD prompt returned:\n${text}`);
+  if (settings().logHudText) console.debug(`[${MODULE_NAME}] AIOS HUD prompt returned:\n${text}`);
+  setBridgeState(hudCache.generationReady ? "READY" : "DEGRADED", hudCache.freshness);
   return text;
+}
+
+function cachedHudIsCompatible(ctx, requestedNodeId = null) {
+  if (!hudCache?.text) return false;
+  const identity = currentIdentity(ctx);
+  if (hudCache.sessionId !== sessionId || hudCache.instanceId !== instanceId || hudCache.conversationKey !== identity.conversationKey) return false;
+  if (requestedNodeId && hudCache.requestedNodeId && hudCache.requestedNodeId !== requestedNodeId) return false;
+  return true;
 }
 
 async function prepareHud(ctx, nodeId, options = {}) {
   const runtimeId = await activateRuntime(ctx, options);
   if (!runtimeId) return null;
-
+  setBridgeState("HUD_PREPARING", { through_node_id: nodeId ?? null });
   const s = settings();
   const params = new URLSearchParams();
   if (nodeId) params.set("through_node_id", nodeId);
   params.set("recent_limit", String(Math.max(1, Number(s.recentLimit ?? 12))));
   if (Number(s.tokenBudget) > 0) params.set("token_budget", String(Math.max(256, Number(s.tokenBudget))));
   params.set("wait_ms", String(Math.max(0, Math.min(Number(options.prepareWaitMs ?? s.prepareWaitMs ?? 1200), 10000))));
-
   const json = await requestJson(
-    apiUrl(`/instance/${encodeURIComponent(runtimeId)}/prepare?${params.toString()}`),
+    apiUrl(`/instance/${encodeURIComponent(runtimeId)}/hud?${params.toString()}`),
     { method: "POST", signal: options.signal },
     Number(options.retries ?? 0),
-    "prepare",
+    "hud",
     options.timeoutMs,
   );
-
-  if (json?.generation_ready) {
-    return cachePreparedHud(json, nodeId);
-  }
-
+  if (json?.generation_ready || !s.requireGenerationReady) return cacheHud(json, nodeId);
   console.warn(`[${MODULE_NAME}] HUD returned but is not generation-ready`, json?.freshness ?? {});
-  if (!s.requireGenerationReady) {
-    return cachePreparedHud(json, nodeId);
-  }
+  setBridgeState("DEGRADED", json?.freshness ?? null);
   return null;
-}
-
-async function fetchRuntimePrompt(ctx, options = {}) {
-  const runtimeId = await activateRuntime(ctx, options);
-  if (!runtimeId) return null;
-
-  const s = settings();
-  const params = new URLSearchParams({ recent_limit: String(Math.max(1, Number(s.recentLimit ?? 12))) });
-  if (Number(s.tokenBudget) > 0) params.set("token_budget", String(Math.max(256, Number(s.tokenBudget))));
-  params.set("wait_ms", "0");
-
-  try {
-    const json = await requestJson(
-      apiUrl(`/instance/${encodeURIComponent(runtimeId)}/frame/text?${params.toString()}`),
-      { method: "GET", signal: options.signal },
-      0,
-      "frame/text",
-      options.timeoutMs,
-    );
-    const text = typeof json?.text === "string" && json.text.trim() ? json.text.trim() : null;
-    if (text) console.debug(`[${MODULE_NAME}] AIOS HUD prompt returned (frame/text):\n${text}`);
-    return text;
-  } catch (error) {
-    console.warn(`[${MODULE_NAME}] AIOS runtime frame fetch failed:`, error);
-    return null;
-  }
-}
-
-async function fetchLegacyMemoryPrompt(ctx, options = {}) {
-  if (!settings().memoryFallback) return null;
-
-  const { characterId, userName } = currentIdentity(ctx);
-  const lastUserMsg = latestMessage(ctx, "user");
-  if (!characterId || !lastUserMsg?.mes) return null;
-
-  const url = apiUrl(
-    `/memory?character=${encodeURIComponent(characterId)}` +
-    `&user=${encodeURIComponent(userName)}` +
-    `&scope=${encodeURIComponent("conversation")}` +
-    `&context=${encodeURIComponent(lastUserMsg.mes)}`,
-  );
-
-  try {
-    const json = await requestJson(url, { method: "GET", signal: options.signal }, 0, "memory-fallback", options.timeoutMs);
-    const chunks = (json?.vector_matches ?? []).map(match => match?.content).filter(Boolean);
-    return chunks.length ? chunks.join("\n---\n") : null;
-  } catch (error) {
-    console.warn(`[${MODULE_NAME}] legacy memory fetch failed:`, error);
-    return null;
-  }
 }
 
 function startHudPrefetch(ctx, nodeId) {
   if (!nodeId) return null;
-  if (prefetchPromise && latestPreparedNodeId === nodeId) return prefetchPromise;
-
+  if (prefetchPromise && hudCache?.requestedNodeId === nodeId) return prefetchPromise;
   const s = settings();
   prefetchPromise = prepareHud(ctx, nodeId, {
     timeoutMs: Math.max(Number(s.requestTimeoutMs ?? 1800), Number(s.prepareWaitMs ?? 1200) + 250),
@@ -468,11 +410,9 @@ function startHudPrefetch(ctx, nodeId) {
     retries: 0,
   }).catch(error => {
     console.warn(`[${MODULE_NAME}] HUD prefetch failed:`, error);
+    setBridgeState("DEGRADED", { reason: "hud_prefetch" });
     return null;
-  }).finally(() => {
-    prefetchPromise = null;
-  });
-
+  }).finally(() => { prefetchPromise = null; });
   return prefetchPromise;
 }
 
@@ -482,103 +422,122 @@ function injectPrompt(ctx, prompt, source = "fresh") {
     setExtensionPrompt(MODULE_NAME, "", s.position ?? extension_prompt_types.IN_PROMPT, s.depth ?? 1);
     return;
   }
-
   const { characterId } = currentIdentity(ctx);
-  const injectionKey = `${characterId}::${instanceId ?? "memory"}::${latestPreparedNodeId ?? latestUserNodeId ?? "unknown"}::${prompt.length}::${source}`;
+  const coordinate = hudCache?.requestedNodeId ?? latestSourceNodeId ?? "unknown";
+  const injectionKey = `${characterId}::${instanceId ?? "none"}::${coordinate}::${prompt.length}::${source}`;
   if (injectionKey === lastInjectionKey) return;
   lastInjectionKey = injectionKey;
+  setExtensionPrompt(MODULE_NAME, formatHudText(prompt), s.position ?? extension_prompt_types.IN_PROMPT, s.depth ?? 1);
+  console.debug(`[${MODULE_NAME}] injected AIOS HUD (${prompt.length} chars, ${source})`, {
+    through_node_id: coordinate,
+    freshness: hudCache?.freshness ?? null,
+  });
+}
 
-  setExtensionPrompt(
-    MODULE_NAME,
-    formatHudText(prompt),
-    s.position ?? extension_prompt_types.IN_PROMPT,
-    s.depth ?? 1,
-  );
-
-  console.debug(`[${MODULE_NAME}] injected AIOS HUD (${prompt.length} chars, ${source})`);
+async function reconcileConversation(ctx = getContext()) {
+  const s = settings();
+  if (!s.enabled || !s.reconcileOnChatLoad || !ctx?.name2) return null;
+  ensureIdentityMatches(ctx);
+  if (reconciliationPromise) return reconciliationPromise;
+  const generation = ++reconciliationGeneration;
+  const conversation = currentIdentity(ctx).conversationKey;
+  const chat = Array.isArray(ctx?.chat) ? ctx.chat : [];
+  reconciliationPromise = (async () => {
+    try {
+      setBridgeState("SYNCING", { conversation, messages: chat.length });
+      await openSession(ctx);
+      let ingested = 0;
+      let finalNodeId = latestSourceNodeId;
+      for (let messageId = 0; messageId < chat.length; messageId++) {
+        if (generation !== reconciliationGeneration || conversation !== currentIdentity(getContext()).conversationKey) return null;
+        const msg = chat[messageId];
+        if (!msg?.mes || msg.is_system) continue;
+        try {
+          const json = await ingestMessage(ctx, messageId, msg, { retries: 0 });
+          if (json?.node_id) finalNodeId = json.node_id;
+          ingested += 1;
+        } catch (error) {
+          console.warn(`[${MODULE_NAME}] transcript reconciliation skipped source slot ${messageId}:`, error);
+        }
+      }
+      latestSourceNodeId = finalNodeId;
+      console.debug(`[${MODULE_NAME}] transcript reconciliation complete`, {
+        conversation,
+        messages_seen: chat.length,
+        messages_ingested: ingested,
+        source_head_node_id: finalNodeId ?? null,
+      });
+      const runtimeId = await activateRuntime(ctx);
+      if (!runtimeId) return null;
+      if (finalNodeId) return await prepareHud(ctx, finalNodeId, { retries: 0 });
+      return null;
+    } catch (error) {
+      console.warn(`[${MODULE_NAME}] conversation reconciliation failed open:`, error);
+      setBridgeState("DEGRADED", { reason: "reconciliation" });
+      return null;
+    } finally {
+      if (generation === reconciliationGeneration) reconciliationPromise = null;
+    }
+  })();
+  return reconciliationPromise;
 }
 
 window[`${MODULE_NAME}_Intercept`] = async function (_chat, _maxContext, abort, type) {
-  console.debug(`[${MODULE_NAME}] interceptor fired`, { type });
+  console.debug(`[${MODULE_NAME}] interceptor fired`, { type, state: bridgeState });
   if (type === "quiet") return;
-
   const s = settings();
   if (!s.enabled) return;
-
   const ctx = getContext();
   if (!ctx?.name2) return;
   ensureIdentityMatches(ctx);
-
-  const lastUserMsg = latestMessage(ctx, "user");
-  if (!lastUserMsg?.mes) return;
-
+  if (!latestMessage(ctx, "user")?.mes) return;
   const budgetMs = Math.max(50, Number(s.generationBudgetMs ?? 900));
-  const generationController = new AbortController();
-  const generationTimer = setTimeout(() => generationController.abort(new DOMException("AIOS generation budget exhausted", "TimeoutError")), budgetMs);
-  const forwardAbort = () => generationController.abort(new DOMException("SillyTavern generation aborted", "AbortError"));
-
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(new DOMException("AIOS generation budget exhausted", "TimeoutError")), budgetMs);
+  const forwardAbort = () => controller.abort(new DOMException("SillyTavern generation aborted", "AbortError"));
   if (abort?.signal) {
     if (abort.signal.aborted) forwardAbort();
     else abort.signal.addEventListener("abort", forwardAbort, { once: true });
   }
-
   try {
     if (pendingUserIngest) {
       await Promise.race([
         pendingUserIngest,
-        new Promise(resolve => generationController.signal.addEventListener("abort", () => resolve(null), { once: true })),
+        new Promise(resolve => controller.signal.addEventListener("abort", () => resolve(null), { once: true })),
       ]);
     }
-
-    if (generationController.signal.aborted) {
-      if (s.useCachedHud && cachedHudText) injectPrompt(ctx, cachedHudText, "cached-budget");
+    const nodeId = latestSourceNodeId;
+    if (controller.signal.aborted) {
+      if (s.useCachedHud && cachedHudIsCompatible(ctx, nodeId)) injectPrompt(ctx, hudCache.text, "cached-budget");
       return;
     }
-
     let prompt = null;
-    let coordinateConflict = false;
-    const nodeId = latestUserNodeId;
-
-    if (nodeId && latestPreparedNodeId === nodeId && cachedHudText) {
-      prompt = cachedHudText;
-    } else if (nodeId) {
+    if (nodeId && cachedHudIsCompatible(ctx, nodeId)) prompt = hudCache.text;
+    else if (nodeId) {
       try {
         prompt = await prepareHud(ctx, nodeId, {
-          signal: generationController.signal,
+          signal: controller.signal,
           timeoutMs: budgetMs,
           prepareWaitMs: Math.min(Number(s.prepareWaitMs ?? 1200), budgetMs),
           retries: 0,
         });
       } catch (error) {
-        const message = String(error?.message ?? "");
-        coordinateConflict = message.startsWith("409 ") && message.includes("current active source head");
-        if (!generationController.signal.aborted) console.warn(`[${MODULE_NAME}] generation-time prepare failed:`, error);
-        if (coordinateConflict) {
-          console.debug(`[${MODULE_NAME}] stale generation coordinates detected; skipping current-head fallbacks for this generation`);
+        if (error?.status === 409 || String(error?.message ?? "").startsWith("409 ")) {
+          console.warn(`[${MODULE_NAME}] exact HUD coordinate rejected; obsolete live fallbacks are disabled`, { through_node_id: nodeId });
+        } else if (!controller.signal.aborted) {
+          console.warn(`[${MODULE_NAME}] generation-time HUD request failed:`, error);
         }
       }
     }
-
-    if (!prompt && s.useCachedHud && cachedHudText) {
-      injectPrompt(ctx, cachedHudText, "cached");
-      return;
-    }
-
-    if (!prompt && !coordinateConflict && !generationController.signal.aborted) {
-      prompt = await fetchRuntimePrompt(ctx, { signal: generationController.signal, timeoutMs: Math.max(50, budgetMs / 2), retries: 0 });
-    }
-
-    if (!prompt && !coordinateConflict && !generationController.signal.aborted) {
-      prompt = await fetchLegacyMemoryPrompt(ctx, { signal: generationController.signal, timeoutMs: Math.max(50, budgetMs / 2) });
-    }
-
-    if (prompt) injectPrompt(ctx, prompt, latestPreparedNodeId === nodeId ? "fresh" : "fallback");
-    else if (!cachedHudText) injectPrompt(ctx, null);
+    if (prompt) return injectPrompt(ctx, prompt, "fresh");
+    if (s.useCachedHud && cachedHudIsCompatible(ctx)) return injectPrompt(ctx, hudCache.text, "cached");
+    injectPrompt(ctx, null);
+    console.debug(`[${MODULE_NAME}] no safe AIOS HUD available; generation continues without AIOS injection`);
   } catch (error) {
     console.warn(`[${MODULE_NAME}] interceptor failed open; SillyTavern generation will continue:`, error);
-    if (s.useCachedHud && cachedHudText) injectPrompt(ctx, cachedHudText, "cached-error");
+    if (s.useCachedHud && cachedHudIsCompatible(ctx)) injectPrompt(ctx, hudCache.text, "cached-error");
   } finally {
-    clearTimeout(generationTimer);
+    clearTimeout(timer);
     if (abort?.signal) abort.signal.removeEventListener("abort", forwardAbort);
   }
 };
@@ -586,100 +545,81 @@ window[`${MODULE_NAME}_Intercept`] = async function (_chat, _maxContext, abort, 
 eventSource.on(LISTEN_SENT, (messageId) => {
   console.debug(`[${MODULE_NAME}] MESSAGE_SENT observed; starting non-blocking user ingest`, { messageId });
   const ctx = getContext();
-
+  ensureIdentityMatches(ctx);
   const ingestPromise = pushLine("user", messageId)
     .then(json => {
-      latestUserNodeId = json?.node_id ?? null;
-      if (latestUserNodeId) startHudPrefetch(ctx, latestUserNodeId);
+      latestSourceNodeId = json?.node_id ?? latestSourceNodeId;
+      if (latestSourceNodeId) startHudPrefetch(ctx, latestSourceNodeId);
       return json;
     })
-    .finally(() => {
-      if (pendingUserIngest === ingestPromise) pendingUserIngest = null;
-    });
-
+    .finally(() => { if (pendingUserIngest === ingestPromise) pendingUserIngest = null; });
   pendingUserIngest = ingestPromise;
-
-  // SillyTavern awaits MESSAGE_SENT listeners. Intentionally return immediately:
-  // the tracked promise is observed later by the bounded generation interceptor.
 });
 
 eventSource.on(LISTEN_AI, () => {
   console.debug(`[${MODULE_NAME}] MESSAGE_RECEIVED observed; waiting for character render`);
   eventSource.once(LISTEN_AI_RENDERED, async (messageId) => {
     console.debug(`[${MODULE_NAME}] CHARACTER_MESSAGE_RENDERED observed`, { messageId });
-    await pushLine("character", messageId);
+    const json = await pushLine("character", messageId);
+    latestSourceNodeId = json?.node_id ?? latestSourceNodeId;
+    if (latestSourceNodeId) startHudPrefetch(getContext(), latestSourceNodeId);
   });
 });
+
+eventSource.on(LISTEN_CHAT_CHANGED, () => {
+  console.debug(`[${MODULE_NAME}] CHAT_CHANGED observed; reconciling active transcript`);
+  resetRuntimeIdentity();
+  const ctx = getContext();
+  ensureIdentityMatches(ctx);
+  void reconcileConversation(ctx);
+});
+
+for (const eventName of [LISTEN_MESSAGE_UPDATED, LISTEN_MESSAGE_SWIPED]) {
+  eventSource.on(eventName, async (messageId) => {
+    const ctx = getContext();
+    ensureIdentityMatches(ctx);
+    const msg = messageById(ctx, messageId);
+    if (!msg?.mes || msg.is_system) return;
+    try {
+      const json = await ingestMessage(ctx, Number(messageId), msg, { retries: 0 });
+      latestSourceNodeId = json?.node_id ?? latestSourceNodeId;
+      if (latestSourceNodeId) startHudPrefetch(ctx, latestSourceNodeId);
+    } catch (error) {
+      console.warn(`[${MODULE_NAME}] source-slot update sync failed`, { eventName, messageId, error });
+    }
+  });
+}
 
 jQuery(async () => {
   const s = settings();
   const html = await renderExtensionTemplateAsync("third-party/MemoryVaultIngest", "settings");
-  const container = $(document.getElementById("extensions_settings2"));
-  container.append(html);
-
+  $(document.getElementById("extensions_settings2")).append(html);
   $("#mvi_enabled").prop("checked", s.enabled).on("change", () => {
     s.enabled = !!$("#mvi_enabled").prop("checked");
     saveSettingsDebounced();
+    if (s.enabled) void reconcileConversation(getContext());
+    else injectPrompt(getContext(), null);
   });
-
   $("#mvi_api_root").val(s.apiRoot || DEFAULT_API_ROOT).on("change", () => {
     s.apiRoot = String($("#mvi_api_root").val() || DEFAULT_API_ROOT).trim();
     resetRuntimeIdentity();
     saveSettingsDebounced();
+    void reconcileConversation(getContext());
   });
-
   $(`input[name="mvi_position"][value="${s.position}"]`).prop("checked", true);
-  $("input[name='mvi_position']").on("change", () => {
-    s.position = Number($("input[name='mvi_position']:checked").val());
-    saveSettingsDebounced();
-  });
-
-  $("#mvi_depth").val(s.depth).on("change", () => {
-    s.depth = Number($("#mvi_depth").val());
-    saveSettingsDebounced();
-  });
-
-  $("#mvi_recent_limit").val(s.recentLimit ?? 12).on("change", () => {
-    s.recentLimit = Number($("#mvi_recent_limit").val());
-    saveSettingsDebounced();
-  });
-
-  $("#mvi_token_budget").val(s.tokenBudget ?? 4000).on("change", () => {
-    s.tokenBudget = Number($("#mvi_token_budget").val());
-    saveSettingsDebounced();
-  });
-
-  $("#mvi_prepare_wait").val(s.prepareWaitMs ?? 1200).on("change", () => {
-    s.prepareWaitMs = Number($("#mvi_prepare_wait").val());
-    saveSettingsDebounced();
-  });
-
-  $("#mvi_generation_budget").val(s.generationBudgetMs ?? 900).on("change", () => {
-    s.generationBudgetMs = Number($("#mvi_generation_budget").val());
-    saveSettingsDebounced();
-  });
-
-  $("#mvi_require_ready").prop("checked", s.requireGenerationReady).on("change", () => {
-    s.requireGenerationReady = !!$("#mvi_require_ready").prop("checked");
-    saveSettingsDebounced();
-  });
-
-  $("#mvi_cached_hud").prop("checked", s.useCachedHud).on("change", () => {
-    s.useCachedHud = !!$("#mvi_cached_hud").prop("checked");
-    saveSettingsDebounced();
-  });
-
-  $("#mvi_tag").prop("checked", s.tagWrapper).on("change", () => {
-    s.tagWrapper = !!$("#mvi_tag").prop("checked");
-    saveSettingsDebounced();
-  });
-
-  $("#mvi_memory_fallback").prop("checked", s.memoryFallback).on("change", () => {
-    s.memoryFallback = !!$("#mvi_memory_fallback").prop("checked");
-    saveSettingsDebounced();
-  });
-
+  $("input[name='mvi_position']").on("change", () => { s.position = Number($("input[name='mvi_position']:checked").val()); saveSettingsDebounced(); });
+  $("#mvi_depth").val(s.depth).on("change", () => { s.depth = Number($("#mvi_depth").val()); saveSettingsDebounced(); });
+  $("#mvi_recent_limit").val(s.recentLimit ?? 12).on("change", () => { s.recentLimit = Number($("#mvi_recent_limit").val()); saveSettingsDebounced(); });
+  $("#mvi_token_budget").val(s.tokenBudget ?? 4000).on("change", () => { s.tokenBudget = Number($("#mvi_token_budget").val()); saveSettingsDebounced(); });
+  $("#mvi_prepare_wait").val(s.prepareWaitMs ?? 1200).on("change", () => { s.prepareWaitMs = Number($("#mvi_prepare_wait").val()); saveSettingsDebounced(); });
+  $("#mvi_generation_budget").val(s.generationBudgetMs ?? 900).on("change", () => { s.generationBudgetMs = Number($("#mvi_generation_budget").val()); saveSettingsDebounced(); });
+  $("#mvi_require_ready").prop("checked", s.requireGenerationReady).on("change", () => { s.requireGenerationReady = !!$("#mvi_require_ready").prop("checked"); saveSettingsDebounced(); });
+  $("#mvi_cached_hud").prop("checked", s.useCachedHud).on("change", () => { s.useCachedHud = !!$("#mvi_cached_hud").prop("checked"); saveSettingsDebounced(); });
+  $("#mvi_tag").prop("checked", s.tagWrapper).on("change", () => { s.tagWrapper = !!$("#mvi_tag").prop("checked"); saveSettingsDebounced(); });
+  $("#mvi_reconcile").prop("checked", s.reconcileOnChatLoad).on("change", () => { s.reconcileOnChatLoad = !!$("#mvi_reconcile").prop("checked"); saveSettingsDebounced(); if (s.reconcileOnChatLoad) void reconcileConversation(getContext()); });
+  $("#mvi_log_hud").prop("checked", s.logHudText).on("change", () => { s.logHudText = !!$("#mvi_log_hud").prop("checked"); saveSettingsDebounced(); });
   console.log(`[${MODULE_NAME}] settings panel registered`);
+  queueMicrotask(() => void reconcileConversation(getContext()));
 });
 
-console.log(`[${MODULE_NAME}] v0.7.2 loaded (source-branch aware HUD prepare bridge)`);
+console.log(`[${MODULE_NAME}] v0.8.0 loaded (canonical AIOS HUD bridge + transcript reconciliation)`);
