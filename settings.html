@@ -4,9 +4,22 @@
     <input type="checkbox" id="mvi_enabled"> Enable AIOS HUD prompt injection
   </label>
 
-  <div style="margin-top:10px;">
-    <label for="mvi_api_root"><b>AIOS API Root:</b></label>
-    <input type="text" id="mvi_api_root" style="width:100%;" placeholder="http://192.168.1.217:8000">
+  <div style="margin-top:12px; padding:10px; border:1px solid var(--SmartThemeBorderColor, #666); border-radius:8px;">
+    <div style="display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom:8px;">
+      <b>AIOS Connection</b>
+      <div style="display:flex; align-items:center; gap:7px; white-space:nowrap;">
+        <span id="mvi_connection_dot" style="display:inline-block; width:10px; height:10px; border-radius:50%; background:#8b8b8b;"></span>
+        <span id="mvi_connection_status">Not tested</span>
+      </div>
+    </div>
+
+    <label for="mvi_api_root"><b>AIOS URL:</b></label>
+    <div style="display:flex; gap:8px; margin-top:5px;">
+      <input type="text" id="mvi_api_root" style="flex:1; min-width:0;" placeholder="http://192.168.1.217:8000">
+      <button type="button" id="mvi_connect" class="menu_button">Save &amp; Connect</button>
+    </div>
+    <div id="mvi_connection_detail" style="margin-top:6px; font-size:0.9em; opacity:0.8; overflow-wrap:anywhere;">Not tested</div>
+    <small>Tests <code>/healthz</code> and saves this URL as the AIOS endpoint. The indicator is refreshed automatically while the extension is enabled.</small>
   </div>
 
   <div style="margin-top:10px;">
