@@ -1,4 +1,4 @@
-/* MemoryVaultIngest v0.8.1 – AIOS live HUD bridge and transcript reconciliation */
+/* MemoryVaultIngest v0.8.2 – AIOS live HUD bridge and transcript reconciliation */
 
 import {
   eventSource,
@@ -15,6 +15,9 @@ import {
 
 const MODULE_NAME = "MemoryVaultIngest";
 const DEFAULT_API_ROOT = "http://192.168.1.217:8000";
+const DEFAULT_REQUEST_TIMEOUT_MS = 10000;
+const MIN_HUD_REQUEST_TIMEOUT_MS = 8000;
+const HEALTH_CHECK_TIMEOUT_MS = 3000;
 
 const defaultSettings = {
   enabled: true,
@@ -25,7 +28,7 @@ const defaultSettings = {
   tokenBudget: 4000,
   prepareWaitMs: 1200,
   generationBudgetMs: 900,
-  requestTimeoutMs: 1800,
+  requestTimeoutMs: DEFAULT_REQUEST_TIMEOUT_MS,
   maxRetries: 1,
   retryDelayMs: 250,
   requireGenerationReady: true,
@@ -190,7 +193,7 @@ function timeoutSignal(timeoutMs, parentSignal = null) {
 
 async function requestJson(url, options = {}, retries = 0, label = "request", timeoutMs = null) {
   const retryDelay = Number(settings().retryDelayMs ?? 250);
-  const requestTimeout = Math.max(50, Number(timeoutMs ?? settings().requestTimeoutMs ?? 1800));
+  const requestTimeout = Math.max(50, Number(timeoutMs ?? settings().requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS));
   let lastError = null;
   const method = options?.method ?? "GET";
   for (let attempt = 0; attempt <= retries; attempt++) {
@@ -224,7 +227,7 @@ async function requestJson(url, options = {}, retries = 0, label = "request", ti
 }
 
 async function probeConnection(options = {}) {
-  const timeoutMs = Math.max(250, Number(options.timeoutMs ?? settings().requestTimeoutMs ?? 1800));
+  const timeoutMs = Math.max(HEALTH_CHECK_TIMEOUT_MS, Number(options.timeoutMs ?? HEALTH_CHECK_TIMEOUT_MS));
   let root;
   try {
     root = normalizeApiRoot(options.apiRoot ?? settings().apiRoot);
@@ -253,7 +256,7 @@ async function probeConnection(options = {}) {
 function startConnectionMonitor() {
   if (connectionProbeTimer) clearInterval(connectionProbeTimer);
   connectionProbeTimer = setInterval(() => {
-    if (settings().enabled) void probeConnection({ timeoutMs: 1200 });
+    if (settings().enabled) void probeConnection({ timeoutMs: HEALTH_CHECK_TIMEOUT_MS });
   }, 15000);
 }
 
@@ -453,17 +456,23 @@ async function prepareHud(ctx, nodeId, options = {}) {
   if (!runtimeId) return null;
   setBridgeState("HUD_PREPARING", { through_node_id: nodeId ?? null });
   const s = settings();
+  const prepareWaitMs = Math.max(0, Math.min(Number(options.prepareWaitMs ?? s.prepareWaitMs ?? 1200), 10000));
+  const hudRequestTimeoutMs = Math.max(
+    MIN_HUD_REQUEST_TIMEOUT_MS,
+    Number(options.timeoutMs ?? s.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS),
+    prepareWaitMs + 3000,
+  );
   const params = new URLSearchParams();
   if (nodeId) params.set("through_node_id", nodeId);
   params.set("recent_limit", String(Math.max(1, Number(s.recentLimit ?? 12))));
   if (Number(s.tokenBudget) > 0) params.set("token_budget", String(Math.max(256, Number(s.tokenBudget))));
-  params.set("wait_ms", String(Math.max(0, Math.min(Number(options.prepareWaitMs ?? s.prepareWaitMs ?? 1200), 10000))));
+  params.set("wait_ms", String(prepareWaitMs));
   const json = await requestJson(
     apiUrl(`/instance/${encodeURIComponent(runtimeId)}/hud?${params.toString()}`),
     { method: "POST", signal: options.signal },
     Number(options.retries ?? 0),
     "hud",
-    options.timeoutMs,
+    hudRequestTimeoutMs,
   );
   if (json?.generation_ready || !s.requireGenerationReady) return cacheHud(json, nodeId);
   console.warn(`[${MODULE_NAME}] HUD returned but is not generation-ready`, json?.freshness ?? {});
@@ -476,7 +485,7 @@ function startHudPrefetch(ctx, nodeId) {
   if (prefetchPromise && hudCache?.requestedNodeId === nodeId) return prefetchPromise;
   const s = settings();
   prefetchPromise = prepareHud(ctx, nodeId, {
-    timeoutMs: Math.max(Number(s.requestTimeoutMs ?? 1800), Number(s.prepareWaitMs ?? 1200) + 250),
+    timeoutMs: Math.max(DEFAULT_REQUEST_TIMEOUT_MS, Number(s.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS)),
     prepareWaitMs: s.prepareWaitMs,
     retries: 0,
   }).catch(error => {
@@ -724,4 +733,4 @@ jQuery(async () => {
   });
 });
 
-console.log(`[${MODULE_NAME}] v0.8.1 loaded (canonical AIOS HUD bridge + connection monitor)`);
+console.log(`[${MODULE_NAME}] v0.8.2 loaded (canonical AIOS HUD bridge + relaxed timing)`);
