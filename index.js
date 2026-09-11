@@ -1,4 +1,4 @@
-/* MemoryVaultIngest v0.8.3 – AIOS live HUD bridge and transcript reconciliation */
+/* MemoryVaultIngest v0.8.4 – AIOS live HUD bridge and transcript reconciliation */
 
 import {
   eventSource,
@@ -31,6 +31,8 @@ const defaultSettings = {
   requestTimeoutMs: DEFAULT_REQUEST_TIMEOUT_MS,
   maxRetries: 1,
   retryDelayMs: 250,
+  hudReadinessAttempts: 3,
+  hudReadinessRetryDelayMs: 500,
   requireGenerationReady: true,
   useCachedHud: true,
   tagWrapper: true,
@@ -198,6 +200,22 @@ function timeoutSignal(timeoutMs, parentSignal = null) {
       if (parentSignal) parentSignal.removeEventListener("abort", forwardAbort);
     },
   };
+}
+
+function abortableDelay(ms, signal = null) {
+  if (signal?.aborted) return Promise.resolve(false);
+  return new Promise(resolve => {
+    const timer = setTimeout(() => {
+      if (signal) signal.removeEventListener("abort", onAbort);
+      resolve(true);
+    }, Math.max(0, Number(ms ?? 0)));
+    const onAbort = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      resolve(false);
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
 async function requestJson(url, options = {}, retries = 0, label = "request", timeoutMs = null) {
@@ -480,21 +498,52 @@ async function prepareHud(ctx, nodeId, options = {}) {
     Number(options.timeoutMs ?? s.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS),
     prepareWaitMs + 3000,
   );
+  const readinessAttempts = Math.max(1, Number(options.readinessAttempts ?? s.hudReadinessAttempts ?? 3));
+  const readinessDelayMs = Math.max(50, Number(options.readinessDelayMs ?? s.hudReadinessRetryDelayMs ?? 500));
   const params = new URLSearchParams();
   if (nodeId) params.set("through_node_id", nodeId);
   params.set("recent_limit", String(Math.max(1, Number(s.recentLimit ?? 12))));
   if (Number(s.tokenBudget) > 0) params.set("token_budget", String(Math.max(256, Number(s.tokenBudget))));
   params.set("wait_ms", String(prepareWaitMs));
-  const json = await requestJson(
-    apiUrl(`/instance/${encodeURIComponent(runtimeId)}/hud?${params.toString()}`),
-    { method: "POST", signal: options.signal },
-    Number(options.retries ?? 0),
-    "hud",
-    hudRequestTimeoutMs,
-  );
-  if (json?.generation_ready || !s.requireGenerationReady) return cacheHud(json, nodeId);
-  console.warn(`[${MODULE_NAME}] HUD returned but is not generation-ready`, json?.freshness ?? {});
-  setBridgeState("DEGRADED", json?.freshness ?? null);
+
+  let lastFreshness = null;
+  for (let attempt = 1; attempt <= readinessAttempts; attempt++) {
+    if (options.signal?.aborted) return null;
+    const json = await requestJson(
+      apiUrl(`/instance/${encodeURIComponent(runtimeId)}/hud?${params.toString()}`),
+      { method: "POST", signal: options.signal },
+      Number(options.retries ?? 0),
+      `hud:${attempt}/${readinessAttempts}`,
+      hudRequestTimeoutMs,
+    );
+    if (json?.generation_ready || !s.requireGenerationReady) return cacheHud(json, nodeId);
+
+    lastFreshness = json?.freshness ?? null;
+    console.warn(`[${MODULE_NAME}] HUD returned but is not generation-ready`, {
+      attempt,
+      attempts: readinessAttempts,
+      through_node_id: nodeId ?? null,
+      ...(lastFreshness ?? {}),
+    });
+
+    if (attempt < readinessAttempts) {
+      setBridgeState("HUD_WAITING", {
+        attempt,
+        attempts: readinessAttempts,
+        through_node_id: nodeId ?? null,
+        ...(lastFreshness ?? {}),
+      });
+      const continued = await abortableDelay(readinessDelayMs * attempt, options.signal);
+      if (!continued) return null;
+    }
+  }
+
+  setBridgeState("DEGRADED", {
+    reason: "hud_readiness_exhausted",
+    through_node_id: nodeId ?? null,
+    attempts: readinessAttempts,
+    ...(lastFreshness ?? {}),
+  });
   return null;
 }
 
@@ -527,6 +576,8 @@ function startHudPrefetch(ctx, nodeId) {
     signal: controller.signal,
     timeoutMs: Math.max(DEFAULT_REQUEST_TIMEOUT_MS, Number(s.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS)),
     prepareWaitMs: s.prepareWaitMs,
+    readinessAttempts: Math.max(1, Number(s.hudReadinessAttempts ?? 3)),
+    readinessDelayMs: Math.max(50, Number(s.hudReadinessRetryDelayMs ?? 500)),
     retries: 0,
   }).then(prompt => {
     const elapsed_ms = Math.round(performance.now() - startedAt);
@@ -675,6 +726,7 @@ window[`${MODULE_NAME}_Intercept`] = async function (_chat, _maxContext, abort, 
           signal: controller.signal,
           timeoutMs: budgetMs,
           prepareWaitMs: Math.min(Number(s.prepareWaitMs ?? 1200), budgetMs),
+          readinessAttempts: 1,
           retries: 0,
         });
       } catch (error) {
@@ -812,4 +864,4 @@ jQuery(async () => {
   });
 });
 
-console.log(`[${MODULE_NAME}] v0.8.3 loaded (coordinate-aware single-flight AIOS HUD bridge)`);
+console.log(`[${MODULE_NAME}] v0.8.4 loaded (coordinate-aware single-flight AIOS HUD bridge with readiness retries)`);
