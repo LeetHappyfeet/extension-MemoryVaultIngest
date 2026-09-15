@@ -1,0 +1,80 @@
+name: Apply AIOS head contract fix
+
+on:
+  push:
+    branches:
+      - test-aios-ingest-head-contract
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: test-aios-ingest-head-contract
+      - name: Patch MemoryVaultIngest
+        shell: python
+        run: |
+          from pathlib import Path
+          p = Path('index.js')
+          s = p.read_text()
+          s = s.replace('/* MemoryVaultIngest v0.8.4 – AIOS live HUD bridge and transcript reconciliation */', '/* MemoryVaultIngest v0.9.0 – authoritative AIOS source-head HUD bridge and transcript reconciliation */')
+
+          old = '''      console.warn(`[${MODULE_NAME}] AIOS !! ${label} failed:`, error);\n      if (!options?.signal?.aborted) setConnectionState("DISCONNECTED", String(error?.message ?? "Connection failed"));'''
+          new = '''      console.warn(`[${MODULE_NAME}] AIOS !! ${label} failed:`, error);\n      // An HTTP response proves AIOS is reachable. Application-level rejections\n      // (especially a stale HUD 409) must not masquerade as disconnection.\n      if (!options?.signal?.aborted) {\n        if (Number.isInteger(error?.status)) setConnectionState("CONNECTED", normalizeApiRoot(settings().apiRoot));\n        else setConnectionState("DISCONNECTED", String(error?.message ?? "Connection failed"));\n      }'''
+          assert old in s
+          s = s.replace(old, new, 1)
+
+          marker = '''function messageById(ctx, messageId) {\n  if (messageId === undefined || messageId === null || messageId === "") return null;\n  return ctx?.chat?.[Number(messageId)] ?? null;\n}\n'''
+          helper = marker + '''\nfunction applyIngestResult(json, options = {}) {\n  if (!json) {\n    return {\n      messageNodeId: null,\n      activeHeadNodeId: null,\n      disposition: null,\n      sourceCurrent: false,\n      shouldPrefetch: false,\n    };\n  }\n\n  const messageNodeId = json?.node_id ?? null;\n  const activeHeadNodeId = json?.source_head_node_id ?? messageNodeId ?? null;\n  const hasAuthoritativeCurrent = typeof json?.source_current === "boolean";\n  const sourceCurrent = hasAuthoritativeCurrent ? json.source_current : Boolean(messageNodeId && activeHeadNodeId === messageNodeId);\n\n  if (activeHeadNodeId) latestSourceNodeId = activeHeadNodeId;\n\n  // Live ingestion may advance HUD demand only when AIOS says the submitted\n  // immutable node is the active source head. Old servers fall back to the\n  // historical node_id behavior for compatibility. Reconciliation suppresses\n  // per-message HUD demand and performs one final prefetch after the walk.\n  const shouldPrefetch = Boolean(activeHeadNodeId && sourceCurrent && !options.reconciling);\n  if (shouldPrefetch) desiredHudNodeId = activeHeadNodeId;\n\n  console.debug(`[${MODULE_NAME}] applied AIOS ingest result`, {\n    message_node_id: messageNodeId,\n    source_head_node_id: activeHeadNodeId,\n    source_current: sourceCurrent,\n    disposition: json?.disposition ?? null,\n    reconciling: Boolean(options.reconciling),\n    should_prefetch: shouldPrefetch,\n  });\n\n  return {\n    messageNodeId,\n    activeHeadNodeId,\n    disposition: json?.disposition ?? null,\n    sourceCurrent,\n    shouldPrefetch,\n  };\n}\n'''
+          assert marker in s
+          s = s.replace(marker, helper, 1)
+
+          old = '''  latestSourceNodeId = json?.node_id ?? latestSourceNodeId;\n  if (json?.node_id) desiredHudNodeId = json.node_id;\n  console.debug(`[${MODULE_NAME}] ingested source slot ${messageId}`, { speaker_type: speakerType, node_id: json?.node_id ?? null });'''
+          new = '''  console.debug(`[${MODULE_NAME}] ingested source slot ${messageId}`, {\n    speaker_type: speakerType,\n    node_id: json?.node_id ?? null,\n    source_head_node_id: json?.source_head_node_id ?? null,\n    source_current: json?.source_current ?? null,\n    disposition: json?.disposition ?? null,\n  });'''
+          assert old in s
+          s = s.replace(old, new, 1)
+
+          old = '''          const json = await ingestMessage(ctx, messageId, msg, { retries: 0 });\n          if (json?.node_id) finalNodeId = json.node_id;\n          ingested += 1;'''
+          new = '''          const json = await ingestMessage(ctx, messageId, msg, { retries: 0 });\n          const result = applyIngestResult(json, { reconciling: true });\n          if (result.activeHeadNodeId) finalNodeId = result.activeHeadNodeId;\n          ingested += 1;'''
+          assert old in s
+          s = s.replace(old, new, 1)
+
+          old = '''    console.warn(`[${MODULE_NAME}] HUD prefetch failed:`, error);\n    setBridgeState("DEGRADED", { reason: "hud_prefetch", node_id: nodeId, elapsed_ms });\n    return null;'''
+          new = '''    if (error?.status === 409 || String(error?.message ?? "").startsWith("409 ")) {\n      console.debug(`[${MODULE_NAME}] HUD prefetch stale-coordinate cancellation`, {\n        node_id: nodeId,\n        desired_node: desiredHudNodeId,\n        elapsed_ms,\n      });\n      return null;\n    }\n    console.warn(`[${MODULE_NAME}] HUD prefetch failed:`, error);\n    setBridgeState("DEGRADED", { reason: "hud_prefetch", node_id: nodeId, elapsed_ms });\n    return null;'''
+          assert old in s
+          s = s.replace(old, new, 1)
+
+          old = '''    .then(json => {\n      latestSourceNodeId = json?.node_id ?? latestSourceNodeId;\n      if (json?.node_id) desiredHudNodeId = json.node_id;\n      if (latestSourceNodeId) startHudPrefetch(ctx, latestSourceNodeId);\n      return json;\n    })'''
+          new = '''    .then(json => {\n      const result = applyIngestResult(json);\n      if (result.shouldPrefetch) startHudPrefetch(ctx, result.activeHeadNodeId);\n      return json;\n    })'''
+          assert old in s
+          s = s.replace(old, new, 1)
+
+          old = '''    const json = await pushLine("character", messageId);\n    latestSourceNodeId = json?.node_id ?? latestSourceNodeId;\n    if (json?.node_id) desiredHudNodeId = json.node_id;\n    if (latestSourceNodeId) startHudPrefetch(getContext(), latestSourceNodeId);'''
+          new = '''    const json = await pushLine("character", messageId);\n    const result = applyIngestResult(json);\n    if (result.shouldPrefetch) startHudPrefetch(getContext(), result.activeHeadNodeId);'''
+          assert old in s
+          s = s.replace(old, new, 1)
+
+          old = '''      const json = await ingestMessage(ctx, Number(messageId), msg, { retries: 0 });\n      latestSourceNodeId = json?.node_id ?? latestSourceNodeId;\n      if (json?.node_id) desiredHudNodeId = json.node_id;\n      if (latestSourceNodeId) startHudPrefetch(ctx, latestSourceNodeId);'''
+          new = '''      const json = await ingestMessage(ctx, Number(messageId), msg, { retries: 0 });\n      const result = applyIngestResult(json);\n      if (result.shouldPrefetch) startHudPrefetch(ctx, result.activeHeadNodeId);'''
+          assert old in s
+          s = s.replace(old, new, 1)
+
+          s = s.replace('console.log(`[${MODULE_NAME}] v0.8.4 loaded (coordinate-aware single-flight AIOS HUD bridge with readiness retries)`);', 'console.log(`[${MODULE_NAME}] v0.9.0 loaded (authoritative source-head single-flight AIOS HUD bridge)`);')
+          p.write_text(s)
+
+          m = Path('manifest.json')
+          ms = m.read_text().replace('"version": "0.8.4"', '"version": "0.9.0"')
+          m.write_text(ms)
+
+      - name: Commit patch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add index.js manifest.json
+          git commit -m "Honor authoritative AIOS source head in HUD bridge"
+          git push origin test-aios-ingest-head-contract
