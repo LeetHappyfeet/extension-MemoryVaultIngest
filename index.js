@@ -1,4 +1,4 @@
-/* MemoryVaultIngest v0.8.4 – AIOS live HUD bridge and transcript reconciliation */
+/* MemoryVaultIngest v0.9.0 – authoritative AIOS source-head HUD bridge and transcript reconciliation */
 
 import {
   eventSource,
@@ -243,7 +243,12 @@ async function requestJson(url, options = {}, retries = 0, label = "request", ti
       lastError = error;
       const aborted = bounded.signal.aborted || error?.name === "AbortError" || error?.name === "TimeoutError";
       console.warn(`[${MODULE_NAME}] AIOS !! ${label} failed:`, error);
-      if (!options?.signal?.aborted) setConnectionState("DISCONNECTED", String(error?.message ?? "Connection failed"));
+      // An HTTP response proves AIOS is reachable. Application-level rejections
+      // (especially a stale HUD 409) must not masquerade as disconnection.
+      if (!options?.signal?.aborted) {
+        if (Number.isInteger(error?.status)) setConnectionState("CONNECTED", normalizeApiRoot(settings().apiRoot));
+        else setConnectionState("DISCONNECTED", String(error?.message ?? "Connection failed"));
+      }
       if (aborted) break;
       if (attempt < retries) await new Promise(resolve => setTimeout(resolve, retryDelay));
     } finally {
@@ -378,6 +383,49 @@ function messageById(ctx, messageId) {
   return ctx?.chat?.[Number(messageId)] ?? null;
 }
 
+function applyIngestResult(json, options = {}) {
+  if (!json) {
+    return {
+      messageNodeId: null,
+      activeHeadNodeId: null,
+      disposition: null,
+      sourceCurrent: false,
+      shouldPrefetch: false,
+    };
+  }
+
+  const messageNodeId = json?.node_id ?? null;
+  const activeHeadNodeId = json?.source_head_node_id ?? messageNodeId ?? null;
+  const hasAuthoritativeCurrent = typeof json?.source_current === "boolean";
+  const sourceCurrent = hasAuthoritativeCurrent ? json.source_current : Boolean(messageNodeId && activeHeadNodeId === messageNodeId);
+
+  if (activeHeadNodeId) latestSourceNodeId = activeHeadNodeId;
+
+  // Live ingestion may advance HUD demand only when AIOS says the submitted
+  // immutable node is the active source head. Old servers fall back to the
+  // historical node_id behavior for compatibility. Reconciliation suppresses
+  // per-message HUD demand and performs one final prefetch after the walk.
+  const shouldPrefetch = Boolean(activeHeadNodeId && sourceCurrent && !options.reconciling);
+  if (shouldPrefetch) desiredHudNodeId = activeHeadNodeId;
+
+  console.debug(`[${MODULE_NAME}] applied AIOS ingest result`, {
+    message_node_id: messageNodeId,
+    source_head_node_id: activeHeadNodeId,
+    source_current: sourceCurrent,
+    disposition: json?.disposition ?? null,
+    reconciling: Boolean(options.reconciling),
+    should_prefetch: shouldPrefetch,
+  });
+
+  return {
+    messageNodeId,
+    activeHeadNodeId,
+    disposition: json?.disposition ?? null,
+    sourceCurrent,
+    shouldPrefetch,
+  };
+}
+
 async function ingestMessage(ctx, messageId, msg, options = {}) {
   if (!msg?.mes || msg.is_system) return null;
   ensureIdentityMatches(ctx);
@@ -410,9 +458,13 @@ async function ingestMessage(ctx, messageId, msg, options = {}) {
     }),
     signal: options.signal,
   }, Number(options.retries ?? settings().maxRetries ?? 1), `ingest:${speakerType}:${messageId}`, options.timeoutMs);
-  latestSourceNodeId = json?.node_id ?? latestSourceNodeId;
-  if (json?.node_id) desiredHudNodeId = json.node_id;
-  console.debug(`[${MODULE_NAME}] ingested source slot ${messageId}`, { speaker_type: speakerType, node_id: json?.node_id ?? null });
+  console.debug(`[${MODULE_NAME}] ingested source slot ${messageId}`, {
+    speaker_type: speakerType,
+    node_id: json?.node_id ?? null,
+    source_head_node_id: json?.source_head_node_id ?? null,
+    source_current: json?.source_current ?? null,
+    disposition: json?.disposition ?? null,
+  });
   return json;
 }
 
@@ -597,6 +649,14 @@ function startHudPrefetch(ctx, nodeId) {
       console.debug(`[${MODULE_NAME}] HUD prefetch ABORT`, { node_id: nodeId, elapsed_ms, reason: controller.signal.reason?.message ?? "aborted" });
       return null;
     }
+    if (error?.status === 409 || String(error?.message ?? "").startsWith("409 ")) {
+      console.debug(`[${MODULE_NAME}] HUD prefetch stale-coordinate cancellation`, {
+        node_id: nodeId,
+        desired_node: desiredHudNodeId,
+        elapsed_ms,
+      });
+      return null;
+    }
     console.warn(`[${MODULE_NAME}] HUD prefetch failed:`, error);
     setBridgeState("DEGRADED", { reason: "hud_prefetch", node_id: nodeId, elapsed_ms });
     return null;
@@ -650,7 +710,8 @@ async function reconcileConversation(ctx = getContext()) {
         if (!msg?.mes || msg.is_system) continue;
         try {
           const json = await ingestMessage(ctx, messageId, msg, { retries: 0 });
-          if (json?.node_id) finalNodeId = json.node_id;
+          const result = applyIngestResult(json, { reconciling: true });
+          if (result.activeHeadNodeId) finalNodeId = result.activeHeadNodeId;
           ingested += 1;
         } catch (error) {
           console.warn(`[${MODULE_NAME}] transcript reconciliation skipped source slot ${messageId}:`, error);
@@ -756,9 +817,8 @@ eventSource.on(LISTEN_SENT, (messageId) => {
   ensureIdentityMatches(ctx);
   const ingestPromise = pushLine("user", messageId)
     .then(json => {
-      latestSourceNodeId = json?.node_id ?? latestSourceNodeId;
-      if (json?.node_id) desiredHudNodeId = json.node_id;
-      if (latestSourceNodeId) startHudPrefetch(ctx, latestSourceNodeId);
+      const result = applyIngestResult(json);
+      if (result.shouldPrefetch) startHudPrefetch(ctx, result.activeHeadNodeId);
       return json;
     })
     .finally(() => { if (pendingUserIngest === ingestPromise) pendingUserIngest = null; });
@@ -770,9 +830,8 @@ eventSource.on(LISTEN_AI, () => {
   eventSource.once(LISTEN_AI_RENDERED, async (messageId) => {
     console.debug(`[${MODULE_NAME}] CHARACTER_MESSAGE_RENDERED observed`, { messageId });
     const json = await pushLine("character", messageId);
-    latestSourceNodeId = json?.node_id ?? latestSourceNodeId;
-    if (json?.node_id) desiredHudNodeId = json.node_id;
-    if (latestSourceNodeId) startHudPrefetch(getContext(), latestSourceNodeId);
+    const result = applyIngestResult(json);
+    if (result.shouldPrefetch) startHudPrefetch(getContext(), result.activeHeadNodeId);
   });
 });
 
@@ -792,9 +851,8 @@ for (const eventName of [LISTEN_MESSAGE_UPDATED, LISTEN_MESSAGE_SWIPED]) {
     if (!msg?.mes || msg.is_system) return;
     try {
       const json = await ingestMessage(ctx, Number(messageId), msg, { retries: 0 });
-      latestSourceNodeId = json?.node_id ?? latestSourceNodeId;
-      if (json?.node_id) desiredHudNodeId = json.node_id;
-      if (latestSourceNodeId) startHudPrefetch(ctx, latestSourceNodeId);
+      const result = applyIngestResult(json);
+      if (result.shouldPrefetch) startHudPrefetch(ctx, result.activeHeadNodeId);
     } catch (error) {
       console.warn(`[${MODULE_NAME}] source-slot update sync failed`, { eventName, messageId, error });
     }
@@ -864,4 +922,4 @@ jQuery(async () => {
   });
 });
 
-console.log(`[${MODULE_NAME}] v0.8.4 loaded (coordinate-aware single-flight AIOS HUD bridge with readiness retries)`);
+console.log(`[${MODULE_NAME}] v0.9.0 loaded (authoritative source-head single-flight AIOS HUD bridge)`);
