@@ -378,6 +378,42 @@ function messageById(ctx, messageId) {
   return ctx?.chat?.[Number(messageId)] ?? null;
 }
 
+// Tool markup is authored intention, not a scene event. The AIOS endpoint
+// independently parses canonical DAG text; client content is not authority.
+function containsResearchRequest(message) {
+  const matches = [...String(message ?? "").matchAll(/<aios_action>([\s\S]{1,4000}?)<\/aios_action>/gi)];
+  if (matches.length !== 1) return false;
+  try {
+    const parsed = JSON.parse(matches[0][1]);
+    return parsed && parsed.op === "research" &&
+      typeof parsed.question === "string" && parsed.question.trim().length >= 3 &&
+      parsed.question.trim().length <= 600;
+  } catch (_) {
+    return false;
+  }
+}
+
+async function dispatchResearchRequest(ctx, msg, ingestReceipt, options = {}) {
+  if (!containsResearchRequest(msg?.mes) || !ingestReceipt?.node_id) return;
+  const runtimeId = instanceId || await activateRuntime(ctx, options);
+  if (!runtimeId) {
+    console.warn("[" + MODULE_NAME + "] research request not dispatched: no active instance");
+    return;
+  }
+  try {
+    const result = await requestJson(
+      apiUrl("/agent/instance/" + encodeURIComponent(runtimeId) + "/research/tool-request"),
+      { method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({source_node_id: ingestReceipt.node_id}), signal: options.signal },
+      0, "research:" + ingestReceipt.node_id, 15000,
+    );
+    console.debug("[" + MODULE_NAME + "] research action receipt", result);
+  } catch (error) {
+    // Transcript ingestion succeeds independently of optional research.
+    console.warn("[" + MODULE_NAME + "] research action dispatch failed", error);
+  }
+}
+
 async function ingestMessage(ctx, messageId, msg, options = {}) {
   if (!msg?.mes || msg.is_system) return null;
   ensureIdentityMatches(ctx);
@@ -413,6 +449,9 @@ async function ingestMessage(ctx, messageId, msg, options = {}) {
   latestSourceNodeId = json?.node_id ?? latestSourceNodeId;
   if (json?.node_id) desiredHudNodeId = json.node_id;
   console.debug(`[${MODULE_NAME}] ingested source slot ${messageId}`, { speaker_type: speakerType, node_id: json?.node_id ?? null });
+  if (isCharacter && containsResearchRequest(msg.mes)) {
+    await dispatchResearchRequest(ctx, msg, json, options);
+  }
   return json;
 }
 
