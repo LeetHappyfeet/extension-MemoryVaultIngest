@@ -449,7 +449,7 @@ async function ingestMessage(ctx, messageId, msg, options = {}) {
   latestSourceNodeId = json?.node_id ?? latestSourceNodeId;
   if (json?.node_id) desiredHudNodeId = json.node_id;
   console.debug(`[${MODULE_NAME}] ingested source slot ${messageId}`, { speaker_type: speakerType, node_id: json?.node_id ?? null });
-  if (isCharacter && containsResearchRequest(msg.mes)) {
+  if (isCharacter && options.dispatchResearchTools && containsResearchRequest(msg.mes)) {
     await dispatchResearchRequest(ctx, msg, json, options);
   }
   return json;
@@ -469,7 +469,8 @@ async function pushLine(speakerType, messageId = null) {
   if (resolvedMessageId === null || resolvedMessageId === undefined || !messageById(ctx, resolvedMessageId)) resolvedMessageId = (ctx?.chat ?? []).indexOf(msg);
   if (resolvedMessageId < 0) return null;
   try {
-    return await ingestMessage(ctx, resolvedMessageId, msg);
+    return await ingestMessage(ctx, resolvedMessageId, msg,
+      { dispatchResearchTools: speakerType === "character" });
   } catch (error) {
     console.error(`[${MODULE_NAME}] ingest failed:`, error);
     return null;
