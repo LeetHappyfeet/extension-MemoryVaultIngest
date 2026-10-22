@@ -19,7 +19,7 @@
       <button type="button" id="mvi_connect" class="menu_button">Save &amp; Connect</button>
     </div>
     <div id="mvi_connection_detail" style="margin-top:6px; font-size:0.9em; opacity:0.8; overflow-wrap:anywhere;">Not tested</div>
-    <small>Tests <code>/healthz</code> and saves this URL as the AIOS endpoint. The indicator is refreshed automatically while the extension is enabled.</small>
+    <small>Checks HTTP availability. Runtime readiness and HUD freshness are reported separately below.</small>
   </div>
 
   <div style="margin-top:10px;">
@@ -59,11 +59,7 @@
   </div>
 
   <div style="margin-top:10px;">
-    <label><input type="checkbox" id="mvi_require_ready"> Require an AIOS generation-ready HUD before treating a fresh frame as authoritative</label>
-  </div>
-
-  <div style="margin-top:10px;">
-    <label><input type="checkbox" id="mvi_cached_hud"> Use the most recent compatible HUD when an exact fresh HUD misses the generation deadline</label>
+    <label><input type="checkbox" id="mvi_cached_hud"> Reuse a generation-ready HUD only for the exact active instance and source coordinate</label>
   </div>
 
   <div style="margin-top:10px;">
@@ -80,5 +76,90 @@
 
   <div style="margin-top:10px;">
     <small>Live generation uses only the canonical <code>POST /instance/{id}/hud</code> endpoint. Legacy <code>/frame/text</code> and <code>/memory</code> fallbacks are intentionally disabled.</small>
+  </div>
+
+  <div id="mvi_controls" style="margin-top:16px;">
+    <h4>AIOS runtime</h4>
+    <div id="mvi_runtime_status" role="status" aria-live="polite">Disconnected</div>
+    <div>Character ID: <code id="mvi_character_id">Open a chat</code></div>
+    <button type="button" class="menu_button" id="mvi_refresh">Refresh state &amp; HUD</button>
+    <details><summary>HUD freshness</summary><pre id="mvi_freshness" style="white-space:pre-wrap;overflow-wrap:anywhere;"></pre></details>
+    <details><summary>Structured HUD</summary><pre id="mvi_frame" style="white-space:pre-wrap;overflow-wrap:anywhere;max-height:24em;overflow:auto;"></pre></details>
+
+    <details>
+      <summary>Character identity</summary>
+      <label><input type="checkbox" id="mvi_sync_cards"> Automatically import authored card changes, filling missing facets</label>
+      <p>Appearance, personality, example dialogue, and explicit AIOS domain metadata are synchronized. Scenario and greeting text are excluded. IDs are persisted in character-card extension data when supported.</p>
+      <button type="button" class="menu_button" id="mvi_sync_identity">Import missing facets</button>
+      <button type="button" class="menu_button" id="mvi_stage_identity">Stage card for review</button>
+      <button type="button" class="menu_button" id="mvi_replace_identity">Replace overlapping authored facets</button>
+      <button type="button" class="menu_button" id="mvi_identity">Inspect identity &amp; candidates</button>
+      <label for="mvi_candidate">Candidate ID</label><input id="mvi_candidate" type="text" class="text_pole">
+      <label for="mvi_identity_reason">Decision reason</label><input id="mvi_identity_reason" type="text" class="text_pole">
+      <button type="button" class="menu_button" id="mvi_identity_accept">Accept candidate</button>
+      <button type="button" class="menu_button" id="mvi_identity_reject">Reject candidate</button>
+    </details>
+
+    <details>
+      <summary>Search character memory</summary>
+      <label for="mvi_query">Short keyword or phrase</label><input id="mvi_query" type="text" maxlength="600" class="text_pole">
+      <button type="button" class="menu_button" id="mvi_recall">Search memory</button>
+      <label><input type="checkbox" id="mvi_native_recall"> Offer AIOS recall as a model tool</label>
+      <small>Search is scoped to this instance and uses substring matching. The optional model tool also requires enabled function calling and a compatible Chat Completion backend.</small>
+    </details>
+
+    <details>
+      <summary>Research</summary>
+      <label for="mvi_question">Research or follow-up question</label><textarea id="mvi_question" maxlength="600" rows="3" class="text_pole"></textarea>
+      <button type="button" class="menu_button" id="mvi_research_open">Open dossier</button>
+      <button type="button" class="menu_button" id="mvi_research_list">Refresh dossiers</button>
+      <label for="mvi_dossier">Dossier</label><select id="mvi_dossier" class="text_pole"></select>
+      <div id="mvi_dossiers"></div>
+      <button type="button" class="menu_button" id="mvi_research_inspect">Inspect sources</button>
+      <button type="button" class="menu_button" id="mvi_research_advance">Discover next sources</button>
+      <button type="button" class="menu_button" id="mvi_research_question">Add follow-up question</button>
+      <div id="mvi_sources" style="max-height:24em;overflow:auto;"></div>
+      <button type="button" class="menu_button" id="mvi_research_study">Study 1–2 selected sections</button>
+      <button type="button" class="menu_button" id="mvi_research_paused">Pause</button>
+      <button type="button" class="menu_button" id="mvi_research_resume">Resume</button>
+      <button type="button" class="menu_button" id="mvi_research_closed">Close</button>
+      <p>Discovery is exposure, not durable knowledge. Study submits sections for ingestion. Closed dossiers may not be reopened. Failed or pending research steps retain their retry ID.</p>
+    </details>
+
+    <details>
+      <summary>Reference resources</summary>
+      <label for="mvi_resource_title">Title</label><input id="mvi_resource_title" type="text" class="text_pole">
+      <label for="mvi_resource_file">UTF-8 text file (optional)</label><input id="mvi_resource_file" type="file" accept=".txt,.md,.text,text/plain,text/markdown">
+      <label for="mvi_resource_text">Or paste resource text</label><textarea id="mvi_resource_text" rows="4" class="text_pole"></textarea>
+      <button type="button" class="menu_button" id="mvi_resource_import">Import reference resource</button>
+      <button type="button" class="menu_button" id="mvi_lore_import">Import last activated lore</button>
+      <p>Imports cold reference material only. AIOS source profiles determine access; this does not grant knowledge or assert world facts. Selected file content takes precedence over pasted text. Nothing is imported automatically.</p>
+    </details>
+
+    <details>
+      <summary>Agent tasks &amp; attention</summary>
+      <label for="mvi_objective">Objective or attention message</label><textarea id="mvi_objective" rows="3" class="text_pole"></textarea>
+      <label for="mvi_task_type">Task type</label><select id="mvi_task_type"><option value="planning">Planning</option><option value="reflection">Reflection</option><option value="research">Research</option><option value="executive">Executive</option><option value="communication">Communication</option></select>
+      <button type="button" class="menu_button" id="mvi_task">Queue task</button>
+      <button type="button" class="menu_button" id="mvi_wake">Send attention event</button>
+      <p>Tasks are queued for the AIOS scheduler. Creation is not automatically retried: after a timeout, check AIOS before creating another task. Attention events wake the agent and are not dialogue or memory observations.</p>
+    </details>
+
+    <details>
+      <summary>Explicit runtime action</summary>
+      <label for="mvi_action_type">Action</label><select id="mvi_action_type"><option value="move">Move</option><option value="inspect">Inspect intent</option><option value="use_item">Use-item intent</option><option value="wait">Wait intent</option></select>
+      <label for="mvi_action_target">Existing target entity UUID</label><input id="mvi_action_target" type="text" class="text_pole">
+      <label for="mvi_action_text">Action description (optional)</label><input id="mvi_action_text" type="text" class="text_pole">
+      <button type="button" class="menu_button" id="mvi_action">Submit runtime action</button>
+      <p>Move commits deterministic location state. Other choices record intent; they do not implement arbitrary inspection or item effects. Uses the latest state version and does not automatically retry conflicts or timeouts.</p>
+    </details>
+
+    <details><summary>Diagnostics</summary>
+      <button type="button" class="menu_button" id="mvi_independent">Connect copied chat independently</button>
+      <p>For a copied chat that inherited another chat’s metadata. Starts a separate session and replays the retained transcript; it does not fork a historical AIOS snapshot.</p>
+      <button type="button" class="menu_button" id="mvi_versions">Runtime versions</button>
+      <button type="button" class="menu_button" id="mvi_atlas">Knowledge atlas health</button>
+    </details>
+    <details open><summary>Operation result</summary><pre id="mvi_result" role="status" style="white-space:pre-wrap;overflow-wrap:anywhere;max-height:28em;overflow:auto;"></pre></details>
   </div>
 </div>

@@ -1,907 +1,438 @@
-/* MemoryVaultIngest v0.8.4 – AIOS live HUD bridge and transcript reconciliation */
-
-import {
-  eventSource,
-  event_types,
-  setExtensionPrompt,
-  extension_prompt_types,
-  saveSettingsDebounced,
-} from "../../../../script.js";
-import {
-  getContext,
-  extension_settings,
-  renderExtensionTemplateAsync,
-} from "../../../extensions.js";
-
-const MODULE_NAME = "MemoryVaultIngest";
-const DEFAULT_API_ROOT = "http://192.168.1.217:8000";
-const DEFAULT_REQUEST_TIMEOUT_MS = 10000;
-const MIN_HUD_REQUEST_TIMEOUT_MS = 8000;
-const HEALTH_CHECK_TIMEOUT_MS = 3000;
-
-const defaultSettings = {
-  enabled: true,
-  apiRoot: DEFAULT_API_ROOT,
-  position: extension_prompt_types.IN_PROMPT,
-  depth: 1,
-  recentLimit: 12,
-  tokenBudget: 4000,
-  prepareWaitMs: 1200,
-  generationBudgetMs: 900,
-  requestTimeoutMs: DEFAULT_REQUEST_TIMEOUT_MS,
-  maxRetries: 1,
-  retryDelayMs: 250,
-  hudReadinessAttempts: 3,
-  hudReadinessRetryDelayMs: 500,
-  requireGenerationReady: true,
-  useCachedHud: true,
-  tagWrapper: true,
-  reconcileOnChatLoad: true,
-  logHudText: true,
-};
-
-const LISTEN_SENT = event_types?.MESSAGE_SENT ?? "message_sent";
-const LISTEN_AI = event_types?.MESSAGE_RECEIVED ?? "message_received";
-const LISTEN_AI_RENDERED = event_types?.CHARACTER_MESSAGE_RENDERED ?? "character_message_rendered";
-const LISTEN_CHAT_CHANGED = event_types?.CHAT_CHANGED ?? "chat_changed";
-const LISTEN_MESSAGE_UPDATED = event_types?.MESSAGE_UPDATED ?? "message_updated";
-const LISTEN_MESSAGE_SWIPED = event_types?.MESSAGE_SWIPED ?? "message_swiped";
-
-let sessionId = null;
-let instanceId = null;
-let activeCharacterId = null;
-let activeUserName = null;
-let activeConversationKey = null;
-let lastInjectionKey = null;
-let pendingUserIngest = null;
-let latestSourceNodeId = null;
-let prefetchPromise = null;
-let prefetchNodeId = null;
-let prefetchController = null;
-let desiredHudNodeId = null;
-let reconciliationPromise = null;
-let reconciliationGeneration = 0;
-let bridgeState = "DISCONNECTED";
-let hudCache = null;
-let connectionState = "UNKNOWN";
-let connectionDetail = "Not tested";
-let connectionProbeTimer = null;
+import { eventSource, event_types, setExtensionPrompt, extension_prompt_types, saveSettingsDebounced } from '../../../../script.js';
+import { getContext, extension_settings, renderExtensionTemplateAsync } from '../../../extensions.js';
+import { AIOSBridge, MODULE, VERSION, defaults, normalizeRoot, selectedCard, normalizeId, uuid, digest, exactHud } from './bridge.js';
 
 function settings() {
-  if (!extension_settings[MODULE_NAME]) {
-    extension_settings[MODULE_NAME] = structuredClone(defaultSettings);
-  } else {
-    for (const [key, value] of Object.entries(defaultSettings)) {
-      if (extension_settings[MODULE_NAME][key] === undefined) extension_settings[MODULE_NAME][key] = value;
+    extension_settings[MODULE] ||= {};
+    for (const [key, value] of Object.entries(defaults)) extension_settings[MODULE][key] ??= value;
+    return extension_settings[MODULE];
+}
+let panelReady = false;
+let generationController = null;
+let generationSequence = 0;
+let lastLore = [];
+let monitor;
+let operationBusy = false;
+const el = id => document.getElementById(id);
+const show = (id, value) => { if (el(id)) el(id).textContent = typeof value === 'string' ? value : JSON.stringify(value, null, 2); };
+const bridge = new AIOSBridge({ getContext, settings, onChange: status => {
+    show('mvi_runtime_status', `${status.state}${status.character_id ? ` — ${status.character_id}` : ''}${status.error ? `: ${status.error}` : ''}`);
+    if (status.freshness) show('mvi_freshness', status.freshness);
+    if (status.frame) show('mvi_frame', status.frame);
+    if (status.state === 'SYNC_BLOCKED') clearPrompt();
+} });
+
+function clearPrompt() {
+    setExtensionPrompt(MODULE, '', settings().position ?? extension_prompt_types.IN_PROMPT, settings().depth);
+}
+function report(error) {
+    if (error?.name === 'AbortError') return;
+    console.warn(`[${MODULE}]`, error);
+    show('mvi_runtime_status', error?.message || String(error));
+}
+function currentScope() {
+    return bridge.scope();
+}
+async function persistCharacterId(ctx, card) {
+    const index = (ctx.characters || []).indexOf(card);
+    if (index < 0 || !card.avatar || !ctx.writeExtensionField) return;
+    const current = card.data?.extensions?.[MODULE] || {};
+    const id = current.character_id || settings().characterIds?.[card.avatar] || normalizeId(card.name || card.data?.name);
+    if (!id) return;
+    settings().characterIds ||= {};
+    settings().characterIds[card.avatar] = id;
+    saveSettingsDebounced();
+    if (!current.character_id) {
+        // Set locally before ST emits CHARACTER_EDITED to avoid recursive writes.
+        card.data ||= {};
+        card.data.extensions ||= {};
+        card.data.extensions[MODULE] = { ...current, character_id: id };
+        try { await ctx.writeExtensionField(index, MODULE, { ...current, character_id: id }); }
+        catch (error) { console.warn(`[${MODULE}] Card mapping uses local settings fallback:`, error.message); }
     }
-    delete extension_settings[MODULE_NAME].memoryFallback;
-  }
-  return extension_settings[MODULE_NAME];
 }
-
-function normalizeApiRoot(value) {
-  let root = String(value ?? "").trim();
-  if (!root) root = DEFAULT_API_ROOT;
-  if (!/^https?:\/\//i.test(root)) root = `http://${root}`;
-  const parsed = new URL(root);
-  if (!/^https?:$/.test(parsed.protocol)) throw new Error("AIOS URL must use http:// or https://");
-  return root.replace(/\/+$/, "");
-}
-
-function renderConnectionState(state = connectionState, detail = connectionDetail) {
-  const dot = document.getElementById("mvi_connection_dot");
-  const label = document.getElementById("mvi_connection_status");
-  const detailNode = document.getElementById("mvi_connection_detail");
-  if (!dot || !label) return;
-
-  const palette = {
-    CONNECTED: "#49c26b",
-    CONNECTING: "#e6b94f",
-    DISCONNECTED: "#e05a5a",
-    UNKNOWN: "#8b8b8b",
-  };
-  dot.style.background = palette[state] ?? palette.UNKNOWN;
-  dot.style.boxShadow = `0 0 7px ${palette[state] ?? palette.UNKNOWN}`;
-  label.textContent = state === "CONNECTED" ? "Connected" : state === "CONNECTING" ? "Connecting…" : state === "DISCONNECTED" ? "Disconnected" : "Not tested";
-  if (detailNode) detailNode.textContent = detail || "";
-}
-
-function setConnectionState(state, detail = "") {
-  connectionState = state;
-  connectionDetail = detail;
-  renderConnectionState();
-}
-
-function setBridgeState(next, detail = null) {
-  if (bridgeState === next && !detail) return;
-  bridgeState = next;
-  console.debug(`[${MODULE_NAME}] state -> ${next}`, detail ?? "");
-}
-
-function normalizeCharId(name) {
-  return String(name ?? "").trim().replace(/\s+/g, "_");
-}
-
-function apiUrl(path) {
-  return `${normalizeApiRoot(settings().apiRoot || DEFAULT_API_ROOT)}${path}`;
-}
-
-function clearHudCache() {
-  hudCache = null;
-  lastInjectionKey = null;
-}
-
-function resetRuntimeIdentity() {
-  if (prefetchController && !prefetchController.signal.aborted) {
-    prefetchController.abort(new DOMException("AIOS runtime identity reset", "AbortError"));
-  }
-  sessionId = null;
-  instanceId = null;
-  activeCharacterId = null;
-  activeUserName = null;
-  activeConversationKey = null;
-  pendingUserIngest = null;
-  latestSourceNodeId = null;
-  desiredHudNodeId = null;
-  prefetchPromise = null;
-  prefetchNodeId = null;
-  prefetchController = null;
-  reconciliationPromise = null;
-  reconciliationGeneration += 1;
-  clearHudCache();
-  setBridgeState("DISCONNECTED");
-}
-
-function conversationKey(ctx) {
-  if (ctx?.groupId) return `group:${ctx.groupId}`;
-  if (ctx?.chatId !== undefined && ctx?.chatId !== null && String(ctx.chatId) !== "") return `chat:${ctx.chatId}`;
-  return "chat:unknown";
-}
-
-function currentIdentity(ctx) {
-  return {
-    characterId: normalizeCharId(ctx?.name2),
-    userName: String(ctx?.name1 ?? "").trim(),
-    conversationKey: conversationKey(ctx),
-  };
-}
-
-function ensureIdentityMatches(ctx) {
-  const { characterId, userName, conversationKey: nextConversationKey } = currentIdentity(ctx);
-  const changed =
-    (activeCharacterId && activeCharacterId !== characterId) ||
-    (activeUserName && activeUserName !== userName) ||
-    (activeConversationKey && activeConversationKey !== nextConversationKey);
-  if (changed) {
-    console.debug(`[${MODULE_NAME}] runtime identity changed; resetting AIOS bridge`, {
-      character_id: characterId,
-      user_name: userName,
-      conversation: nextConversationKey,
-    });
-    resetRuntimeIdentity();
-  }
-  activeCharacterId = characterId;
-  activeUserName = userName;
-  activeConversationKey = nextConversationKey;
-}
-
-function timeoutSignal(timeoutMs, parentSignal = null) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(new DOMException("AIOS request timed out", "TimeoutError")), Math.max(1, Number(timeoutMs || 1)));
-  const forwardAbort = () => controller.abort(parentSignal?.reason ?? new DOMException("Aborted", "AbortError"));
-  if (parentSignal) {
-    if (parentSignal.aborted) forwardAbort();
-    else parentSignal.addEventListener("abort", forwardAbort, { once: true });
-  }
-  return {
-    signal: controller.signal,
-    cleanup() {
-      clearTimeout(timer);
-      if (parentSignal) parentSignal.removeEventListener("abort", forwardAbort);
-    },
-  };
-}
-
-function abortableDelay(ms, signal = null) {
-  if (signal?.aborted) return Promise.resolve(false);
-  return new Promise(resolve => {
-    const timer = setTimeout(() => {
-      if (signal) signal.removeEventListener("abort", onAbort);
-      resolve(true);
-    }, Math.max(0, Number(ms ?? 0)));
-    const onAbort = () => {
-      clearTimeout(timer);
-      signal?.removeEventListener("abort", onAbort);
-      resolve(false);
-    };
-    signal?.addEventListener("abort", onAbort, { once: true });
-  });
-}
-
-async function requestJson(url, options = {}, retries = 0, label = "request", timeoutMs = null) {
-  const retryDelay = Number(settings().retryDelayMs ?? 250);
-  const requestTimeout = Math.max(50, Number(timeoutMs ?? settings().requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS));
-  let lastError = null;
-  const method = options?.method ?? "GET";
-  for (let attempt = 0; attempt <= retries; attempt++) {
-    const bounded = timeoutSignal(requestTimeout, options?.signal ?? null);
+async function synchronize() {
+    if (!settings().enabled) return;
+    const ctx = getContext();
     try {
-      console.debug(`[${MODULE_NAME}] AIOS -> ${label} (${method}) attempt ${attempt + 1}/${retries + 1}`, url);
-      const response = await fetch(url, { ...options, signal: bounded.signal });
-      if (!response.ok) {
-        const body = await response.text();
-        const error = new Error(`${response.status} ${response.statusText}: ${body}`);
-        error.status = response.status;
-        error.body = body;
-        throw error;
-      }
-      const json = await response.json();
-      setConnectionState("CONNECTED", normalizeApiRoot(settings().apiRoot));
-      console.debug(`[${MODULE_NAME}] AIOS <- ${label} ${response.status}`);
-      return json;
+        const card = selectedCard(ctx, null, bridge.drafted);
+        const metadata = ctx.chatMetadata;
+        const epoch = bridge.epoch;
+        await persistCharacterId(ctx, card);
+        if (metadata !== getContext().chatMetadata || epoch !== bridge.epoch) return;
+        const scope = bridge.scope(ctx, card);
+        show('mvi_character_id', scope.data.character_id);
+        if (settings().reconcileOnChatLoad) await bridge.reconcile(scope);
+        else await scope.live.queue.run(() => bridge.connect(scope));
+        if (bridge.current(scope)) void bridge.prefetch(scope);
+    } catch (error) { report(error); }
+}
+async function probe() {
+    if (!settings().enabled) return;
+    show('mvi_connection_status', 'Checking HTTP connection…');
+    const epoch = bridge.epoch;
+    try {
+        const root = normalizeRoot(settings().apiRoot);
+        await bridge.request(root, '/healthz', { timeoutMs: 3000 });
+        if (epoch !== bridge.epoch || !settings().enabled || root !== normalizeRoot(settings().apiRoot)) return;
+        show('mvi_connection_status', 'HTTP reachable');
+        show('mvi_connection_detail', 'API reachable. Runtime and HUD readiness are shown separately below.');
+        if (el('mvi_connection_dot')) el('mvi_connection_dot').style.background = '#49c26b';
     } catch (error) {
-      lastError = error;
-      const aborted = bounded.signal.aborted || error?.name === "AbortError" || error?.name === "TimeoutError";
-      console.warn(`[${MODULE_NAME}] AIOS !! ${label} failed:`, error);
-      if (!options?.signal?.aborted) setConnectionState("DISCONNECTED", String(error?.message ?? "Connection failed"));
-      if (aborted) break;
-      if (attempt < retries) await new Promise(resolve => setTimeout(resolve, retryDelay));
-    } finally {
-      bounded.cleanup();
+        if (epoch !== bridge.epoch || !settings().enabled) return;
+        show('mvi_connection_status', 'Disconnected');
+        show('mvi_connection_detail', error.message);
+        if (el('mvi_connection_dot')) el('mvi_connection_dot').style.background = '#e05a5a';
     }
-  }
-  throw lastError;
 }
-
-async function probeConnection(options = {}) {
-  const timeoutMs = Math.max(HEALTH_CHECK_TIMEOUT_MS, Number(options.timeoutMs ?? HEALTH_CHECK_TIMEOUT_MS));
-  let root;
-  try {
-    root = normalizeApiRoot(options.apiRoot ?? settings().apiRoot);
-  } catch (error) {
-    setConnectionState("DISCONNECTED", error.message);
-    return false;
-  }
-
-  setConnectionState("CONNECTING", root);
-  const bounded = timeoutSignal(timeoutMs);
-  try {
-    const response = await fetch(`${root}/healthz`, { method: "GET", signal: bounded.signal, cache: "no-store" });
-    if (!response.ok) throw new Error(`Health check returned HTTP ${response.status}`);
-    setConnectionState("CONNECTED", root);
-    console.debug(`[${MODULE_NAME}] AIOS health check OK`, root);
-    return true;
-  } catch (error) {
-    setConnectionState("DISCONNECTED", `${root} — ${error?.message ?? "unreachable"}`);
-    console.warn(`[${MODULE_NAME}] AIOS health check failed`, error);
-    return false;
-  } finally {
-    bounded.cleanup();
-  }
+function reset() {
+    generationController?.abort();
+    generationSequence++;
+    bridge.reset();
+    clearPrompt();
+    lastLore = [];
+    show('mvi_result', '');
+    show('mvi_frame', '');
+    show('mvi_freshness', '');
+    show('mvi_dossiers', '');
+    show('mvi_sources', '');
 }
-
-function startConnectionMonitor() {
-  if (connectionProbeTimer) clearInterval(connectionProbeTimer);
-  connectionProbeTimer = setInterval(() => {
-    if (settings().enabled) void probeConnection({ timeoutMs: HEALTH_CHECK_TIMEOUT_MS });
-  }, 15000);
+function listen(name, handler) {
+    const event = event_types?.[name];
+    if (event) eventSource.on(event, handler);
 }
-
-async function openSession(ctx, options = {}) {
-  ensureIdentityMatches(ctx);
-  if (sessionId) return sessionId;
-  const { characterId, userName, conversationKey: sourceSessionId } = currentIdentity(ctx);
-  const json = await requestJson(apiUrl("/session"), {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      topic: `${characterId || "chat"}-${sourceSessionId}`,
-      source: "SillyTavern",
-      source_session_id: sourceSessionId,
-      meta: {
-        character_id: characterId,
-        user_name: userName,
-        chat_id: ctx?.chatId ?? null,
-        group_id: ctx?.groupId ?? null,
-      },
-    }),
-    signal: options.signal,
-  }, 0, "session", options.timeoutMs);
-  sessionId = json.session_id;
-  setBridgeState("SESSION_RESOLVED", { session_id: sessionId, source_session_id: sourceSessionId });
-  return sessionId;
-}
-
-async function activateRuntime(ctx, options = {}) {
-  ensureIdentityMatches(ctx);
-  if (instanceId) return instanceId;
-  const { characterId, userName } = currentIdentity(ctx);
-  if (!characterId || !userName) return null;
-  await openSession(ctx, options);
-  const maxAttempts = Math.max(1, Number(options.activationAttempts ?? 3));
-  const retryDelay = Math.max(25, Number(options.activationRetryDelayMs ?? settings().retryDelayMs ?? 250));
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    if (options.signal?.aborted) return null;
+function liveMessage(index, dispatchResearch = false) {
+    if (!settings().enabled) return;
+    const ctx = getContext();
+    const message = ctx.chat?.[Number(index)];
+    if (!message?.mes || message.is_system) return;
     try {
-      const json = await requestJson(
-        apiUrl(`/character/${encodeURIComponent(characterId)}/activate`),
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            user_name: userName,
-            session_id: sessionId,
-            scope_key: "conversation",
-            controller_type: "agent",
-            controller_ref: `sillytavern:${characterId}`,
-          }),
-          signal: options.signal,
-        },
-        0,
-        `activate:${attempt}/${maxAttempts}`,
-        options.timeoutMs,
-      );
-      instanceId = json.instance_id;
-      setBridgeState("RUNTIME_ACTIVE", { instance_id: instanceId });
-      return instanceId;
-    } catch (error) {
-      const notFound = error?.status === 404 || String(error?.message ?? "").startsWith("404 ");
-      if (!notFound || attempt >= maxAttempts || options.signal?.aborted) {
-        console.warn(`[${MODULE_NAME}] runtime activation unavailable:`, error);
-        setBridgeState("DEGRADED", { reason: "runtime_activation" });
-        return null;
-      }
-      await Promise.race([
-        new Promise(resolve => setTimeout(resolve, retryDelay * attempt)),
-        new Promise(resolve => options.signal?.addEventListener("abort", () => resolve(null), { once: true })),
-      ]);
+        const scope = currentScope();
+        // submit() enqueues synchronously, before ST starts its next generation.
+        void bridge.submit(scope, Number(index), message, { dispatchResearch }).then(() => bridge.prefetch(scope)).catch(report);
+    } catch (error) { report(error); }
+}
+listen('MESSAGE_SENT', index => liveMessage(index));
+// Subscribe directly; a stale one-shot listener must never consume another chat's render.
+listen('CHARACTER_MESSAGE_RENDERED', index => liveMessage(index, true));
+listen('MESSAGE_UPDATED', index => liveMessage(index));
+listen('MESSAGE_SWIPED', index => liveMessage(index));
+listen('CHAT_CHANGED', () => { reset(); void synchronize(); });
+listen('CHAT_RENAMED', event => {
+    if (!settings().enabled || !event) return;
+    const ctx = getContext();
+    const saved = ctx.chatMetadata?.[MODULE]?.servers?.[normalizeRoot(settings().apiRoot)];
+    const bare = name => String(name || '').replace(/\.jsonl$/, '');
+    if (saved && bare(saved.chat_id) === bare(event.oldFileName) && bare(ctx.chatId) === bare(event.newFileName)) {
+        saved.chat_id = ctx.chatId;
+        void ctx.saveMetadata?.();
+        void synchronize();
     }
-  }
-  return null;
-}
-
-function messageRole(message) {
-  const isSystem = Boolean(message?.is_system);
-  const isUser = !isSystem && Boolean(message?.is_user || message?.sender === "user");
-  return { isSystem, isUser, isCharacter: !isSystem && !isUser };
-}
-
-function latestMessage(ctx, speakerType) {
-  return [...(ctx?.chat ?? [])].reverse().find(message => {
-    const { isUser, isCharacter } = messageRole(message);
-    return speakerType === "user" ? isUser : isCharacter;
-  });
-}
-
-function messageById(ctx, messageId) {
-  if (messageId === undefined || messageId === null || messageId === "") return null;
-  return ctx?.chat?.[Number(messageId)] ?? null;
-}
-
-// Tool markup is authored intention, not a scene event. The AIOS endpoint
-// independently parses canonical DAG text; client content is not authority.
-function containsResearchRequest(message) {
-  const matches = [...String(message ?? "").matchAll(/<aios_action>([\s\S]{1,4000}?)<\/aios_action>/gi)];
-  if (matches.length !== 1) return false;
-  try {
-    const parsed = JSON.parse(matches[0][1]);
-    return parsed && parsed.op === "research" &&
-      typeof parsed.question === "string" && parsed.question.trim().length >= 3 &&
-      parsed.question.trim().length <= 600;
-  } catch (_) {
-    return false;
-  }
-}
-
-async function dispatchResearchRequest(ctx, msg, ingestReceipt, options = {}) {
-  if (!containsResearchRequest(msg?.mes) || !ingestReceipt?.node_id) return;
-  const runtimeId = instanceId || await activateRuntime(ctx, options);
-  if (!runtimeId) {
-    console.warn("[" + MODULE_NAME + "] research request not dispatched: no active instance");
-    return;
-  }
-  try {
-    const result = await requestJson(
-      apiUrl("/agent/instance/" + encodeURIComponent(runtimeId) + "/research/tool-request"),
-      { method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({source_node_id: ingestReceipt.node_id}), signal: options.signal },
-      0, "research:" + ingestReceipt.node_id, 15000,
-    );
-    console.debug("[" + MODULE_NAME + "] research action receipt", result);
-  } catch (error) {
-    // Transcript ingestion succeeds independently of optional research.
-    console.warn("[" + MODULE_NAME + "] research action dispatch failed", error);
-  }
-}
-
-async function ingestMessage(ctx, messageId, msg, options = {}) {
-  if (!msg?.mes || msg.is_system) return null;
-  ensureIdentityMatches(ctx);
-  await openSession(ctx, options);
-  const { isUser, isCharacter } = messageRole(msg);
-  if (!isUser && !isCharacter) return null;
-  const speakerType = isUser ? "user" : "character";
-  const { characterId, userName } = currentIdentity(ctx);
-  const json = await requestJson(apiUrl("/ingest"), {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      session_id: sessionId,
-      speaker_id: isUser ? ctx.name1 : ctx.name2,
-      speaker_type: speakerType,
-      recipient_id: ctx.groupId ? null : (isUser ? ctx.name2 : ctx.name1),
-      viewpoint_id: isCharacter ? characterId : null,
-      character_id: characterId,
-      user_name: userName,
-      text: msg.mes,
-      kind: "chat_message",
-      scope_key: "conversation",
-      payload: {
-        source: "SillyTavern",
-        chat_id: ctx?.chatId ?? null,
-        group_id: ctx?.groupId ?? null,
-        message_id: Number(messageId),
-        swipe_id: msg?.swipe_id ?? msg?.swipeId ?? null,
-      },
-    }),
-    signal: options.signal,
-  }, Number(options.retries ?? settings().maxRetries ?? 1), `ingest:${speakerType}:${messageId}`, options.timeoutMs);
-  latestSourceNodeId = json?.node_id ?? latestSourceNodeId;
-  if (json?.node_id) desiredHudNodeId = json.node_id;
-  console.debug(`[${MODULE_NAME}] ingested source slot ${messageId}`, { speaker_type: speakerType, node_id: json?.node_id ?? null });
-  if (isCharacter && options.dispatchResearchTools && containsResearchRequest(msg.mes)) {
-    await dispatchResearchRequest(ctx, msg, json, options);
-  }
-  return json;
-}
-
-async function pushLine(speakerType, messageId = null) {
-  const ctx = getContext();
-  ensureIdentityMatches(ctx);
-  let msg = messageById(ctx, messageId);
-  if (msg) {
-    const role = messageRole(msg);
-    if ((speakerType === "user" && !role.isUser) || (speakerType === "character" && !role.isCharacter)) msg = null;
-  }
-  if (!msg) msg = latestMessage(ctx, speakerType);
-  if (!msg?.mes) return null;
-  let resolvedMessageId = messageId;
-  if (resolvedMessageId === null || resolvedMessageId === undefined || !messageById(ctx, resolvedMessageId)) resolvedMessageId = (ctx?.chat ?? []).indexOf(msg);
-  if (resolvedMessageId < 0) return null;
-  try {
-    return await ingestMessage(ctx, resolvedMessageId, msg,
-      { dispatchResearchTools: speakerType === "character" });
-  } catch (error) {
-    console.error(`[${MODULE_NAME}] ingest failed:`, error);
-    return null;
-  }
-}
-
-function formatHudText(text) {
-  if (!text) return "";
-  if (!settings().tagWrapper) return text;
-  return `<aios_hud>\nThe following is AIOS runtime context for the active character. Treat it as current character/world state and retrieved knowledge, not as dialogue spoken by the user.\n\n${text}\n</aios_hud>`;
-}
-
-function cacheHud(json, requestedNodeId) {
-  const resolvedNodeId = requestedNodeId ?? json?.freshness?.requested_source_node_id ?? null;
-  if (resolvedNodeId && desiredHudNodeId && resolvedNodeId !== desiredHudNodeId) {
-    console.debug(`[${MODULE_NAME}] ignoring stale HUD completion`, {
-      requested_node: resolvedNodeId,
-      desired_node: desiredHudNodeId,
-    });
-    return null;
-  }
-  const text = typeof json?.text === "string" ? json.text.trim() : "";
-  if (!text) return null;
-  hudCache = {
-    sessionId,
-    instanceId,
-    conversationKey: activeConversationKey,
-    requestedNodeId: resolvedNodeId,
-    sourceTimelineId: json?.freshness?.source_timeline_id ?? json?.frame?.source_timeline_id ?? null,
-    sourceHeadNodeId: json?.freshness?.source_head_node_id ?? json?.freshness?.current_source_head_node_id ?? null,
-    generationReady: Boolean(json?.generation_ready),
-    freshness: json?.freshness ?? null,
-    frame: json?.frame ?? null,
-    text,
-    preparedAt: Date.now(),
-  };
-  console.debug(`[${MODULE_NAME}] cached AIOS HUD`, {
-    generation_ready: hudCache.generationReady,
-    requested_node: hudCache.requestedNodeId,
-    source_head_node: hudCache.sourceHeadNodeId,
-    freshness: hudCache.freshness,
-    chars: text.length,
-  });
-  if (settings().logHudText) console.debug(`[${MODULE_NAME}] AIOS HUD prompt returned:\n${text}`);
-  setBridgeState(hudCache.generationReady ? "READY" : "DEGRADED", hudCache.freshness);
-  return text;
-}
-
-function cachedHudIsCompatible(ctx, requestedNodeId = null) {
-  if (!hudCache?.text) return false;
-  const identity = currentIdentity(ctx);
-  if (hudCache.sessionId !== sessionId || hudCache.instanceId !== instanceId || hudCache.conversationKey !== identity.conversationKey) return false;
-  if (requestedNodeId && hudCache.requestedNodeId && hudCache.requestedNodeId !== requestedNodeId) return false;
-  return true;
-}
-
-async function prepareHud(ctx, nodeId, options = {}) {
-  const runtimeId = await activateRuntime(ctx, options);
-  if (!runtimeId) return null;
-  setBridgeState("HUD_PREPARING", { through_node_id: nodeId ?? null });
-  const s = settings();
-  const prepareWaitMs = Math.max(0, Math.min(Number(options.prepareWaitMs ?? s.prepareWaitMs ?? 1200), 10000));
-  const hudRequestTimeoutMs = Math.max(
-    MIN_HUD_REQUEST_TIMEOUT_MS,
-    Number(options.timeoutMs ?? s.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS),
-    prepareWaitMs + 3000,
-  );
-  const readinessAttempts = Math.max(1, Number(options.readinessAttempts ?? s.hudReadinessAttempts ?? 3));
-  const readinessDelayMs = Math.max(50, Number(options.readinessDelayMs ?? s.hudReadinessRetryDelayMs ?? 500));
-  const params = new URLSearchParams();
-  if (nodeId) params.set("through_node_id", nodeId);
-  params.set("recent_limit", String(Math.max(1, Number(s.recentLimit ?? 12))));
-  if (Number(s.tokenBudget) > 0) params.set("token_budget", String(Math.max(256, Number(s.tokenBudget))));
-  params.set("wait_ms", String(prepareWaitMs));
-
-  let lastFreshness = null;
-  for (let attempt = 1; attempt <= readinessAttempts; attempt++) {
-    if (options.signal?.aborted) return null;
-    const json = await requestJson(
-      apiUrl(`/instance/${encodeURIComponent(runtimeId)}/hud?${params.toString()}`),
-      { method: "POST", signal: options.signal },
-      Number(options.retries ?? 0),
-      `hud:${attempt}/${readinessAttempts}`,
-      hudRequestTimeoutMs,
-    );
-    if (json?.generation_ready || !s.requireGenerationReady) return cacheHud(json, nodeId);
-
-    lastFreshness = json?.freshness ?? null;
-    console.warn(`[${MODULE_NAME}] HUD returned but is not generation-ready`, {
-      attempt,
-      attempts: readinessAttempts,
-      through_node_id: nodeId ?? null,
-      ...(lastFreshness ?? {}),
-    });
-
-    if (attempt < readinessAttempts) {
-      setBridgeState("HUD_WAITING", {
-        attempt,
-        attempts: readinessAttempts,
-        through_node_id: nodeId ?? null,
-        ...(lastFreshness ?? {}),
-      });
-      const continued = await abortableDelay(readinessDelayMs * attempt, options.signal);
-      if (!continued) return null;
-    }
-  }
-
-  setBridgeState("DEGRADED", {
-    reason: "hud_readiness_exhausted",
-    through_node_id: nodeId ?? null,
-    attempts: readinessAttempts,
-    ...(lastFreshness ?? {}),
-  });
-  return null;
-}
-
-function startHudPrefetch(ctx, nodeId) {
-  if (!nodeId) return null;
-  desiredHudNodeId = nodeId;
-
-  if (prefetchPromise && prefetchNodeId === nodeId) {
-    console.debug(`[${MODULE_NAME}] HUD prefetch REUSE`, { node_id: nodeId });
-    return prefetchPromise;
-  }
-
-  if (prefetchController && !prefetchController.signal.aborted) {
-    console.debug(`[${MODULE_NAME}] HUD prefetch SUPERSEDE`, {
-      from_node: prefetchNodeId,
-      to_node: nodeId,
-    });
-    prefetchController.abort(new DOMException("HUD prefetch superseded", "AbortError"));
-  }
-
-  const s = settings();
-  const controller = new AbortController();
-  const startedAt = performance.now();
-  prefetchController = controller;
-  prefetchNodeId = nodeId;
-
-  console.debug(`[${MODULE_NAME}] HUD prefetch START`, { node_id: nodeId });
-
-  const promise = prepareHud(ctx, nodeId, {
-    signal: controller.signal,
-    timeoutMs: Math.max(DEFAULT_REQUEST_TIMEOUT_MS, Number(s.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS)),
-    prepareWaitMs: s.prepareWaitMs,
-    readinessAttempts: Math.max(1, Number(s.hudReadinessAttempts ?? 3)),
-    readinessDelayMs: Math.max(50, Number(s.hudReadinessRetryDelayMs ?? 500)),
-    retries: 0,
-  }).then(prompt => {
-    const elapsed_ms = Math.round(performance.now() - startedAt);
-    if (nodeId !== desiredHudNodeId) {
-      console.debug(`[${MODULE_NAME}] HUD prefetch STALE-DISCARD`, {
-        node_id: nodeId,
-        desired_node: desiredHudNodeId,
-        elapsed_ms,
-      });
-      return null;
-    }
-    console.debug(`[${MODULE_NAME}] HUD prefetch COMPLETE`, { node_id: nodeId, elapsed_ms, cached: Boolean(prompt) });
-    return prompt;
-  }).catch(error => {
-    const elapsed_ms = Math.round(performance.now() - startedAt);
-    if (controller.signal.aborted) {
-      console.debug(`[${MODULE_NAME}] HUD prefetch ABORT`, { node_id: nodeId, elapsed_ms, reason: controller.signal.reason?.message ?? "aborted" });
-      return null;
-    }
-    console.warn(`[${MODULE_NAME}] HUD prefetch failed:`, error);
-    setBridgeState("DEGRADED", { reason: "hud_prefetch", node_id: nodeId, elapsed_ms });
-    return null;
-  }).finally(() => {
-    if (prefetchPromise === promise) {
-      prefetchPromise = null;
-      prefetchNodeId = null;
-      prefetchController = null;
-    }
-  });
-
-  prefetchPromise = promise;
-  return promise;
-}
-
-function injectPrompt(ctx, prompt, source = "fresh") {
-  const s = settings();
-  if (!prompt) {
-    setExtensionPrompt(MODULE_NAME, "", s.position ?? extension_prompt_types.IN_PROMPT, s.depth ?? 1);
-    return;
-  }
-  const { characterId } = currentIdentity(ctx);
-  const coordinate = hudCache?.requestedNodeId ?? latestSourceNodeId ?? "unknown";
-  const injectionKey = `${characterId}::${instanceId ?? "none"}::${coordinate}::${prompt.length}::${source}`;
-  if (injectionKey === lastInjectionKey) return;
-  lastInjectionKey = injectionKey;
-  setExtensionPrompt(MODULE_NAME, formatHudText(prompt), s.position ?? extension_prompt_types.IN_PROMPT, s.depth ?? 1);
-  console.debug(`[${MODULE_NAME}] injected AIOS HUD (${prompt.length} chars, ${source})`, {
-    through_node_id: coordinate,
-    freshness: hudCache?.freshness ?? null,
-  });
-}
-
-async function reconcileConversation(ctx = getContext()) {
-  const s = settings();
-  if (!s.enabled || !s.reconcileOnChatLoad || !ctx?.name2) return null;
-  ensureIdentityMatches(ctx);
-  if (reconciliationPromise) return reconciliationPromise;
-  const generation = ++reconciliationGeneration;
-  const conversation = currentIdentity(ctx).conversationKey;
-  const chat = Array.isArray(ctx?.chat) ? ctx.chat : [];
-  reconciliationPromise = (async () => {
+});
+listen('GROUP_MEMBER_DRAFTED', member => {
+    generationController?.abort();
+    generationSequence++;
+    clearPrompt();
+    bridge.drafted = member;
+    void synchronize();
+});
+listen('CHARACTER_EDITED', () => { if (settings().syncCards) void synchronize(); });
+listen('PERSONA_CHANGED', () => { reset(); void synchronize(); });
+function blockTranscript() {
+    if (!settings().enabled) return;
+    clearPrompt();
+    generationController?.abort();
     try {
-      setBridgeState("SYNCING", { conversation, messages: chat.length });
-      await openSession(ctx);
-      let ingested = 0;
-      let finalNodeId = latestSourceNodeId;
-      for (let messageId = 0; messageId < chat.length; messageId++) {
-        if (generation !== reconciliationGeneration || conversation !== currentIdentity(getContext()).conversationKey) return null;
-        const msg = chat[messageId];
-        if (!msg?.mes || msg.is_system) continue;
-        try {
-          const json = await ingestMessage(ctx, messageId, msg, { retries: 0 });
-          if (json?.node_id) finalNodeId = json.node_id;
-          ingested += 1;
-        } catch (error) {
-          console.warn(`[${MODULE_NAME}] transcript reconciliation skipped source slot ${messageId}:`, error);
+        const scope = currentScope();
+        // All perspectives share the changed transcript; none may reuse cached knowledge.
+        for (const data of Object.values(scope.saved.runtimes)) {
+            data.blocked = 'Transcript removal needs AIOS retraction support. Start a new chat to continue AIOS synchronization.';
         }
-      }
-      latestSourceNodeId = finalNodeId;
-      desiredHudNodeId = finalNodeId ?? desiredHudNodeId;
-      console.debug(`[${MODULE_NAME}] transcript reconciliation complete`, {
-        conversation,
-        messages_seen: chat.length,
-        messages_ingested: ingested,
-        source_head_node_id: finalNodeId ?? null,
-      });
-      const runtimeId = await activateRuntime(ctx);
-      if (!runtimeId) return null;
-      if (finalNodeId) return await startHudPrefetch(ctx, finalNodeId);
-      return null;
-    } catch (error) {
-      console.warn(`[${MODULE_NAME}] conversation reconciliation failed open:`, error);
-      setBridgeState("DEGRADED", { reason: "reconciliation" });
-      return null;
-    } finally {
-      if (generation === reconciliationGeneration) reconciliationPromise = null;
-    }
-  })();
-  return reconciliationPromise;
+        for (const runtime of bridge.live.values()) {
+            runtime.cache = null;
+            runtime.hudController?.abort();
+            runtime.blocked = 'Transcript removal needs AIOS retraction support. Start a new chat to continue AIOS synchronization.';
+        }
+        bridge.block(scope, scope.data.blocked);
+    } catch (error) { report(error); }
 }
+listen('MESSAGE_DELETED', blockTranscript);
+listen('MESSAGE_SWIPE_DELETED', blockTranscript);
+listen('CHAT_DELETED', () => reset());
+listen('WORLD_INFO_ACTIVATED', entries => { lastLore = structuredClone(entries || []); });
+listen('GENERATION_STOPPED', () => { generationController?.abort(); clearPrompt(); });
+listen('GENERATION_ENDED', () => { generationController?.abort(); });
 
-window[`${MODULE_NAME}_Intercept`] = async function (_chat, _maxContext, abort, type) {
-  console.debug(`[${MODULE_NAME}] interceptor fired`, { type, state: bridgeState });
-  if (type === "quiet") return;
-  const s = settings();
-  if (!s.enabled) return;
-  const ctx = getContext();
-  if (!ctx?.name2) return;
-  ensureIdentityMatches(ctx);
-  if (!latestMessage(ctx, "user")?.mes) return;
-  const budgetMs = Math.max(50, Number(s.generationBudgetMs ?? 900));
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(new DOMException("AIOS generation budget exhausted", "TimeoutError")), budgetMs);
-  const forwardAbort = () => controller.abort(new DOMException("SillyTavern generation aborted", "AbortError"));
-  if (abort?.signal) {
-    if (abort.signal.aborted) forwardAbort();
-    else abort.signal.addEventListener("abort", forwardAbort, { once: true });
-  }
-  try {
-    if (pendingUserIngest) {
-      await Promise.race([
-        pendingUserIngest,
-        new Promise(resolve => controller.signal.addEventListener("abort", () => resolve(null), { once: true })),
-      ]);
-    }
-    const nodeId = latestSourceNodeId;
-    if (controller.signal.aborted) {
-      if (s.useCachedHud && cachedHudIsCompatible(ctx, nodeId)) injectPrompt(ctx, hudCache.text, "cached-budget");
-      return;
-    }
-    let prompt = null;
-    let promptSource = "fresh";
-    if (nodeId && cachedHudIsCompatible(ctx, nodeId)) {
-      prompt = hudCache.text;
-      promptSource = "cached-exact";
-    } else if (nodeId && prefetchPromise && prefetchNodeId === nodeId) {
-      console.debug(`[${MODULE_NAME}] generation reusing in-flight HUD prefetch`, { node_id: nodeId, budget_ms: budgetMs });
-      prompt = await Promise.race([
-        prefetchPromise,
-        new Promise(resolve => controller.signal.addEventListener("abort", () => resolve(null), { once: true })),
-      ]);
-      promptSource = "prefetch";
-    } else if (nodeId) {
-      try {
-        prompt = await prepareHud(ctx, nodeId, {
-          signal: controller.signal,
-          timeoutMs: budgetMs,
-          prepareWaitMs: Math.min(Number(s.prepareWaitMs ?? 1200), budgetMs),
-          readinessAttempts: 1,
-          retries: 0,
+window[`${MODULE}_Intercept`] = async function (_chat, _contextSize, _abort, type) {
+    clearPrompt();
+    if (!settings().enabled || ['quiet', 'impersonate'].includes(type)) return;
+    generationController?.abort();
+    const controller = new AbortController();
+    generationController = controller;
+    const sequence = ++generationSequence;
+    const timer = setTimeout(() => controller.abort(), Math.max(50, settings().generationBudgetMs));
+    let onAbort;
+    try {
+        const scope = currentScope();
+        const cancelled = new Promise(resolve => {
+            onAbort = () => resolve(null);
+            controller.signal.addEventListener('abort', onAbort, { once: true });
         });
-      } catch (error) {
-        if (error?.status === 409 || String(error?.message ?? "").startsWith("409 ")) {
-          console.warn(`[${MODULE_NAME}] exact HUD coordinate rejected; obsolete live fallbacks are disabled`, { through_node_id: nodeId });
-        } else if (!controller.signal.aborted) {
-          console.warn(`[${MODULE_NAME}] generation-time HUD request failed:`, error);
-        }
-      }
+        const hud = await Promise.race([bridge.generationHud(scope, controller.signal), cancelled]);
+        if (!hud || sequence !== generationSequence || controller.signal.aborted || !bridge.current(scope) ||
+            scope.live.blocked || !exactHud(hud, scope.data, scope.data.source_head_node_id)) return;
+        const text = settings().tagWrapper
+            ? `<aios_hud>\nAIOS runtime context for the active character; character/world state and retrieved knowledge, not user dialogue.\n\n${hud.text}\n</aios_hud>`
+            : hud.text;
+        setExtensionPrompt(MODULE, text, settings().position ?? extension_prompt_types.IN_PROMPT, settings().depth);
+    } catch (error) { report(error); }
+    finally {
+        clearTimeout(timer);
+        if (onAbort) controller.signal.removeEventListener('abort', onAbort);
+        if (generationController === controller) generationController = null;
     }
-    if (prompt) return injectPrompt(ctx, prompt, promptSource);
-    if (s.useCachedHud && cachedHudIsCompatible(ctx)) return injectPrompt(ctx, hudCache.text, "cached");
-    injectPrompt(ctx, null);
-    console.debug(`[${MODULE_NAME}] no safe AIOS HUD available; generation continues without AIOS injection`);
-  } catch (error) {
-    console.warn(`[${MODULE_NAME}] interceptor failed open; SillyTavern generation will continue:`, error);
-    if (s.useCachedHud && cachedHudIsCompatible(ctx)) injectPrompt(ctx, hudCache.text, "cached-error");
-  } finally {
-    clearTimeout(timer);
-    if (abort?.signal) abort.signal.removeEventListener("abort", forwardAbort);
-  }
 };
 
-eventSource.on(LISTEN_SENT, (messageId) => {
-  console.debug(`[${MODULE_NAME}] MESSAGE_SENT observed; starting non-blocking user ingest`, { messageId });
-  const ctx = getContext();
-  ensureIdentityMatches(ctx);
-  const ingestPromise = pushLine("user", messageId)
-    .then(json => {
-      latestSourceNodeId = json?.node_id ?? latestSourceNodeId;
-      if (json?.node_id) desiredHudNodeId = json.node_id;
-      if (latestSourceNodeId) startHudPrefetch(ctx, latestSourceNodeId);
-      return json;
-    })
-    .finally(() => { if (pendingUserIngest === ingestPromise) pendingUserIngest = null; });
-  pendingUserIngest = ingestPromise;
-});
-
-eventSource.on(LISTEN_AI, () => {
-  console.debug(`[${MODULE_NAME}] MESSAGE_RECEIVED observed; waiting for character render`);
-  eventSource.once(LISTEN_AI_RENDERED, async (messageId) => {
-    console.debug(`[${MODULE_NAME}] CHARACTER_MESSAGE_RENDERED observed`, { messageId });
-    const json = await pushLine("character", messageId);
-    latestSourceNodeId = json?.node_id ?? latestSourceNodeId;
-    if (json?.node_id) desiredHudNodeId = json.node_id;
-    if (latestSourceNodeId) startHudPrefetch(getContext(), latestSourceNodeId);
-  });
-});
-
-eventSource.on(LISTEN_CHAT_CHANGED, () => {
-  console.debug(`[${MODULE_NAME}] CHAT_CHANGED observed; reconciling active transcript`);
-  resetRuntimeIdentity();
-  const ctx = getContext();
-  ensureIdentityMatches(ctx);
-  void reconcileConversation(ctx);
-});
-
-for (const eventName of [LISTEN_MESSAGE_UPDATED, LISTEN_MESSAGE_SWIPED]) {
-  eventSource.on(eventName, async (messageId) => {
+function registerRecall() {
     const ctx = getContext();
-    ensureIdentityMatches(ctx);
-    const msg = messageById(ctx, messageId);
-    if (!msg?.mes || msg.is_system) return;
-    try {
-      const json = await ingestMessage(ctx, Number(messageId), msg, { retries: 0 });
-      latestSourceNodeId = json?.node_id ?? latestSourceNodeId;
-      if (json?.node_id) desiredHudNodeId = json.node_id;
-      if (latestSourceNodeId) startHudPrefetch(ctx, latestSourceNodeId);
-    } catch (error) {
-      console.warn(`[${MODULE_NAME}] source-slot update sync failed`, { eventName, messageId, error });
-    }
-  });
+    ctx.unregisterFunctionTool?.('aios_recall');
+    if (!settings().nativeRecall || !ctx.registerFunctionTool) return;
+    ctx.registerFunctionTool({
+        name: 'aios_recall', displayName: 'Search AIOS memory',
+        description: 'Search knowledge already acquired by this character instance. Use a short keyword or phrase. Does not research new sources.',
+        parameters: { type: 'object', properties: { query: { type: 'string', description: 'Short memory keyword or phrase' } }, required: ['query'] },
+        shouldRegister: () => settings().enabled && settings().nativeRecall && Boolean(getContext().isToolCallingSupported?.()),
+        action: async ({ query }) => {
+            try {
+                const scope = currentScope();
+                const result = await bridge.recall(scope, query);
+                if (currentScope().key !== scope.key) throw new Error('The active character changed during recall');
+                return JSON.stringify(result);
+            }
+            catch (error) { return JSON.stringify({ error: error.message }); }
+        },
+        formatMessage: () => 'Searching character memory…',
+    });
 }
-
-jQuery(async () => {
-  const s = settings();
-  const html = await renderExtensionTemplateAsync("third-party/MemoryVaultIngest", "settings");
-  $(document.getElementById("extensions_settings2")).append(html);
-
-  const apiRootInput = $("#mvi_api_root");
-  apiRootInput.val(s.apiRoot || DEFAULT_API_ROOT);
-  renderConnectionState();
-
-  $("#mvi_connect").on("click", async () => {
-    let root;
+async function runControl(work) {
+    if (operationBusy) return;
+    operationBusy = true;
+    const buttons = [...document.querySelectorAll('#mvi_controls button')];
+    buttons.forEach(button => { button.disabled = true; });
+    let scope;
     try {
-      root = normalizeApiRoot(apiRootInput.val());
-    } catch (error) {
-      setConnectionState("DISCONNECTED", error.message);
-      return;
+        scope = currentScope();
+        const result = await work(scope);
+        if (bridge.current(scope) && currentScope().key === scope.key) show('mvi_result', result);
+    } catch (error) { if (!scope || bridge.current(scope)) { report(error); show('mvi_result', error.message); } }
+    finally { operationBusy = false; buttons.forEach(button => { button.disabled = false; }); }
+}
+function input(id) { return String(el(id)?.value || '').trim(); }
+function dossierId() {
+    const value = input('mvi_dossier');
+    if (!value) throw new Error('Select a research dossier first');
+    return encodeURIComponent(value);
+}
+function renderDossiers(scope, data) {
+    if (!bridge.current(scope)) return;
+    const select = el('mvi_dossier');
+    const old = select.value;
+    select.replaceChildren();
+    for (const dossier of data.dossiers || []) {
+        const option = document.createElement('option');
+        option.value = dossier.dossier_id;
+        option.textContent = `${dossier.status}: ${dossier.question}`;
+        select.append(option);
     }
-    apiRootInput.val(root);
-    s.apiRoot = root;
-    resetRuntimeIdentity();
-    saveSettingsDebounced();
-    const connected = await probeConnection({ apiRoot: root });
-    if (connected && s.enabled) void reconcileConversation(getContext());
-  });
-
-  apiRootInput.on("keydown", event => {
-    if (event.key === "Enter") {
-      event.preventDefault();
-      $("#mvi_connect").trigger("click");
+    if ([...select.options].some(option => option.value === old)) select.value = old;
+    else if (scope.data.last_research?.dossier_id) select.value = scope.data.last_research.dossier_id;
+    show('mvi_dossiers', `${data.dossiers?.length || 0} dossiers. Discovery does not mean durable knowledge.`);
+}
+async function inspectDossier(scope) {
+    const result = await bridge.feature(scope, `research/${dossierId()}`);
+    if (bridge.current(scope)) {
+        const sources = el('mvi_sources');
+        sources.replaceChildren();
+        for (const source of result.sources || []) {
+            const label = document.createElement('label');
+            label.style.display = 'block';
+            const checkbox = document.createElement('input');
+            checkbox.type = 'checkbox';
+            checkbox.value = source.section_id;
+            checkbox.disabled = ['submitted', 'ingested'].includes(source.status) || ['submitted', 'ingested'].includes(source.materialization_status);
+            label.append(checkbox, document.createTextNode(` ${source.title || source.heading || source.section_id}: ${source.excerpt || ''}`));
+            sources.append(label);
+        }
     }
-  });
-
-  $("#mvi_enabled").prop("checked", s.enabled).on("change", () => {
-    s.enabled = !!$("#mvi_enabled").prop("checked");
-    saveSettingsDebounced();
-    if (s.enabled) {
-      void probeConnection();
-      void reconcileConversation(getContext());
-    } else {
-      injectPrompt(getContext(), null);
-    }
-  });
-  $(`input[name="mvi_position"][value="${s.position}"]`).prop("checked", true);
-  $("input[name='mvi_position']").on("change", () => { s.position = Number($("input[name='mvi_position']:checked").val()); saveSettingsDebounced(); });
-  $("#mvi_depth").val(s.depth).on("change", () => { s.depth = Number($("#mvi_depth").val()); saveSettingsDebounced(); });
-  $("#mvi_recent_limit").val(s.recentLimit ?? 12).on("change", () => { s.recentLimit = Number($("#mvi_recent_limit").val()); saveSettingsDebounced(); });
-  $("#mvi_token_budget").val(s.tokenBudget ?? 4000).on("change", () => { s.tokenBudget = Number($("#mvi_token_budget").val()); saveSettingsDebounced(); });
-  $("#mvi_prepare_wait").val(s.prepareWaitMs ?? 1200).on("change", () => { s.prepareWaitMs = Number($("#mvi_prepare_wait").val()); saveSettingsDebounced(); });
-  $("#mvi_generation_budget").val(s.generationBudgetMs ?? 900).on("change", () => { s.generationBudgetMs = Number($("#mvi_generation_budget").val()); saveSettingsDebounced(); });
-  $("#mvi_require_ready").prop("checked", s.requireGenerationReady).on("change", () => { s.requireGenerationReady = !!$("#mvi_require_ready").prop("checked"); saveSettingsDebounced(); });
-  $("#mvi_cached_hud").prop("checked", s.useCachedHud).on("change", () => { s.useCachedHud = !!$("#mvi_cached_hud").prop("checked"); saveSettingsDebounced(); });
-  $("#mvi_tag").prop("checked", s.tagWrapper).on("change", () => { s.tagWrapper = !!$("#mvi_tag").prop("checked"); saveSettingsDebounced(); });
-  $("#mvi_reconcile").prop("checked", s.reconcileOnChatLoad).on("change", () => { s.reconcileOnChatLoad = !!$("#mvi_reconcile").prop("checked"); saveSettingsDebounced(); if (s.reconcileOnChatLoad) void reconcileConversation(getContext()); });
-  $("#mvi_log_hud").prop("checked", s.logHudText).on("change", () => { s.logHudText = !!$("#mvi_log_hud").prop("checked"); saveSettingsDebounced(); });
-
-  console.log(`[${MODULE_NAME}] settings panel registered`);
-  startConnectionMonitor();
-  queueMicrotask(async () => {
-    await probeConnection();
-    void reconcileConversation(getContext());
-  });
-});
-
-console.log(`[${MODULE_NAME}] v0.8.4 loaded (coordinate-aware single-flight AIOS HUD bridge with readiness retries)`);
+    return result;
+}
+async function notify(scope, eventType, payload, externalId = uuid()) {
+    const key = 'memoryvaultingest';
+    await bridge.feature(scope, '/agent/integrations', { method: 'POST', body: {
+        integration_key: key, integration_type: 'sillytavern', display_name: 'MemoryVaultIngest',
+        capabilities: ['lifecycle_events'], config: { client_version: VERSION },
+    } });
+    return bridge.feature(scope, `/agent/integrations/${key}/event`, { method: 'POST', body: {
+        external_event_id: externalId, instance_id: scope.data.instance_id, event_type: eventType, payload,
+    } });
+}
+async function importResource(scope, { text, title, sourceId }) {
+    if (!text.trim()) throw new Error('Choose a UTF-8 text file or paste resource text');
+    if (text.length > 2_000_000) throw new Error('Resource is too large; import up to 2 million characters at a time');
+    return bridge.feature(scope, '/corpus/document', { method: 'POST', body: {
+        text, title, source_id: sourceId, source_kind: 'document', source_uri: null,
+        meta: { client: MODULE, conversation_key: scope.saved.conversationKey,
+            character_id: scope.data.character_id, identity_binding: 'external' },
+    } });
+}
+async function initialize() {
+    if (panelReady) return;
+    panelReady = true;
+    try {
+        const html = await renderExtensionTemplateAsync('third-party/MemoryVaultIngest', 'settings');
+        $('#extensions_settings2').append(html);
+        const s = settings();
+        el('mvi_api_root').value = s.apiRoot;
+        const controls = { mvi_enabled: 'enabled', mvi_cached_hud: 'useCachedHud', mvi_reconcile: 'reconcileOnChatLoad',
+            mvi_log_hud: 'logHudText', mvi_tag: 'tagWrapper', mvi_sync_cards: 'syncCards', mvi_native_recall: 'nativeRecall' };
+        for (const [id, key] of Object.entries(controls)) {
+            el(id).checked = s[key];
+            el(id).addEventListener('change', () => {
+                s[key] = el(id).checked;
+                saveSettingsDebounced();
+                if (key === 'nativeRecall') registerRecall();
+                if (key === 'enabled') { reset(); if (s.enabled) void synchronize(); }
+            });
+        }
+        for (const [id, key] of Object.entries({ mvi_depth: 'depth', mvi_recent_limit: 'recentLimit', mvi_token_budget: 'tokenBudget',
+            mvi_prepare_wait: 'prepareWaitMs', mvi_generation_budget: 'generationBudgetMs' })) {
+            el(id).value = s[key];
+            el(id).addEventListener('change', () => {
+                const value = Number(el(id).value);
+                s[key] = Number.isFinite(value) ? Math.max(Number(el(id).min || 0), Math.min(Number(el(id).max || Infinity), value)) : defaults[key];
+                el(id).value = s[key];
+                saveSettingsDebounced();
+                for (const runtime of bridge.live.values()) runtime.cache = null;
+            });
+        }
+        document.querySelectorAll('input[name="mvi_position"]').forEach(radio => {
+            radio.checked = Number(radio.value) === s.position;
+            radio.addEventListener('change', () => { s.position = Number(radio.value); saveSettingsDebounced(); clearPrompt(); });
+        });
+        el('mvi_connect').addEventListener('click', async () => {
+            try { s.apiRoot = normalizeRoot(input('mvi_api_root')); } catch (error) { report(error); return; }
+            el('mvi_api_root').value = s.apiRoot;
+            saveSettingsDebounced(); reset(); await probe(); await synchronize();
+        });
+        const bind = (id, work) => el(id).addEventListener('click', () => void runControl(work));
+        bind('mvi_refresh', async scope => { const state = await bridge.refreshState(scope); void bridge.prefetch(scope); return state; });
+        bind('mvi_sync_identity', scope => scope.live.queue.run(() => bridge.syncIdentity(scope, { force: true })));
+        bind('mvi_stage_identity', scope => scope.live.queue.run(() => bridge.syncIdentity(scope, { staged: true })));
+        bind('mvi_replace_identity', scope => scope.live.queue.run(() => bridge.syncIdentity(scope, { replace: true })));
+        for (const decision of ['accept', 'reject']) bind(`mvi_identity_${decision}`, scope => {
+            const candidate = input('mvi_candidate');
+            if (!candidate) throw new Error('Enter a candidate ID from the identity inspection');
+            bridge.invalidate(scope);
+            return bridge.feature(scope, `/character/${encodeURIComponent(scope.data.character_id)}/identity/candidate/${encodeURIComponent(candidate)}/${decision}`, {
+                method: 'POST', body: { actor: 'sillytavern_operator', reason: input('mvi_identity_reason') || null },
+            });
+        });
+        bind('mvi_identity', scope => bridge.feature(scope, `/character/${encodeURIComponent(scope.data.character_id)}/identity`));
+        bind('mvi_recall', scope => bridge.recall(scope, input('mvi_query')));
+        bind('mvi_research_list', async scope => { const data = await bridge.feature(scope, 'research'); renderDossiers(scope, data); return data; });
+        bind('mvi_research_open', async scope => {
+            const question = input('mvi_question');
+            if (question.length < 3 || question.length > 600) throw new Error('Enter a research question of 3–600 characters');
+            const result = await bridge.feature(scope, 'research', { method: 'POST', body: { question } });
+            renderDossiers(scope, await bridge.feature(scope, 'research'));
+            if (bridge.current(scope) && result.dossier_id) el('mvi_dossier').value = result.dossier_id;
+            return result;
+        });
+        bind('mvi_research_inspect', inspectDossier);
+        bind('mvi_research_advance', async scope => {
+            const result = await bridge.researchStep(scope, input('mvi_dossier') || dossierId(), 'advance', { include_fanwork: false });
+            await inspectDossier(scope); return result;
+        });
+        bind('mvi_research_study', async scope => {
+            const section_ids = [...document.querySelectorAll('#mvi_sources input:checked')].map(node => node.value);
+            if (section_ids.length < 1 || section_ids.length > 2) throw new Error('Select one or two exposed source sections');
+            const result = await bridge.researchStep(scope, input('mvi_dossier') || dossierId(), 'study', { section_ids });
+            await inspectDossier(scope); return result;
+        });
+        bind('mvi_research_question', scope => {
+            const question = input('mvi_question');
+            if (question.length < 3 || question.length > 600) throw new Error('Enter a follow-up question of 3–600 characters');
+            return bridge.feature(scope, `research/${dossierId()}/question`, { method: 'POST', body: { question } });
+        });
+        for (const status of ['paused', 'open', 'closed']) bind(status === 'open' ? 'mvi_research_resume' : `mvi_research_${status}`, scope =>
+            bridge.feature(scope, `research/${dossierId()}/status`, { method: 'POST', body: { status } }));
+        el('mvi_dossier').addEventListener('change', () => show('mvi_sources', 'Inspect this dossier to select its sources.'));
+        bind('mvi_resource_import', async scope => {
+            const file = el('mvi_resource_file').files?.[0];
+            if (file?.size > 4_000_000) throw new Error('Choose a text file smaller than 4 MB');
+            const text = file ? await file.text() : el('mvi_resource_text').value;
+            const title = input('mvi_resource_title') || file?.name || 'SillyTavern resource';
+            return importResource(scope, { text, title, sourceId: `sillytavern:${scope.saved.conversationKey}:resource:${await digest(title)}` });
+        });
+        bind('mvi_lore_import', async scope => {
+            if (!lastLore.length) throw new Error('No activated lore captured yet; generate a reply first');
+            const entries = structuredClone(lastLore);
+            const results = [];
+            for (const entry of entries) {
+                if (!entry.content?.trim()) continue;
+                results.push(await importResource(scope, { text: entry.content, title: entry.comment || `Lore ${entry.uid}`,
+                    sourceId: `sillytavern:${scope.saved.conversationKey}:lore:${entry.world || 'book'}:${entry.uid ?? await digest(entry.content)}` }));
+            }
+            return { imported: results.length, documents: results, knowledge_acquired: false };
+        });
+        bind('mvi_wake', scope => notify(scope, 'USER_ATTENTION', { message: input('mvi_objective') || 'User requested attention from SillyTavern' }));
+        bind('mvi_task', scope => {
+            const objective = input('mvi_objective');
+            if (!objective) throw new Error('Enter a task objective');
+            return bridge.feature(scope, 'task', { method: 'POST', body: { task_type: input('mvi_task_type'), objective } });
+        });
+        bind('mvi_action', async scope => {
+            const state = await bridge.refreshState(scope);
+            const action_type = input('mvi_action_type');
+            const target_entity_id = input('mvi_action_target') || null;
+            if (action_type === 'move' && !target_entity_id) throw new Error('Move requires an existing location entity ID');
+            const result = await bridge.feature(scope, `/instance/${scope.data.instance_id}/action`, { method: 'POST', body: {
+                expected_state_version: state.state_version, action_type, target_entity_id,
+                text: input('mvi_action_text') || null, payload: { source: 'SillyTavern', operator_requested: true },
+            } });
+            bridge.invalidate(scope);
+            scope.data.state_version = result.state_version;
+            await bridge.save(scope);
+            void bridge.prefetch(scope);
+            return result;
+        });
+        el('mvi_independent').addEventListener('click', async () => {
+            if (operationBusy || !settings().enabled) return;
+            try {
+                const ctx = getContext();
+                if (!ctx.chatMetadata) throw new Error('Open a chat first');
+                const root = normalizeRoot(settings().apiRoot);
+                const all = ctx.chatMetadata[MODULE] ||= { version: 2, servers: {} };
+                all.servers ||= {};
+                const saved = all.servers[root];
+                if (!saved || (String(saved.chat_id) === String(ctx.chatId) && String(saved.group_id ?? '') === String(ctx.groupId ?? ''))) {
+                    throw new Error('This control is only for a copied chat with an inherited AIOS mapping.');
+                }
+                all.servers[root] = { conversationKey: `chat:${uuid()}`, chat_id: ctx.chatId, group_id: ctx.groupId ?? null, runtimes: {},
+                    parent_conversation_key: saved.conversationKey };
+                reset();
+                await ctx.saveMetadata?.();
+                await synchronize();
+            } catch (error) { report(error); }
+        });
+        bind('mvi_versions', scope => bridge.feature(scope, '/agent/runtime/versions'));
+        bind('mvi_atlas', scope => bridge.feature(scope, '/agent/knowledge-atlas/health'));
+        registerRecall();
+        monitor = setInterval(() => void probe(), 15000);
+        await probe();
+        await synchronize();
+    } catch (error) { panelReady = false; report(error); }
+}
+jQuery(() => void initialize());
+window.addEventListener('beforeunload', () => { clearInterval(monitor); bridge.reset(); });
+console.log(`[${MODULE}] v${VERSION} loaded`);
