@@ -1,0 +1,11 @@
+{
+  "name": "memoryvaultingest",
+  "version": "0.9.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test",
+    "check": "node --check index.js && node --check bridge.js",
+    "test:browser": "node scripts/browser-smoke.mjs"
+  }
+}

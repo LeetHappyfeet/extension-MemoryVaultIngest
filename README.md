@@ -1,190 +1,143 @@
 # MemoryVaultIngest
 
-**MemoryVaultIngest is a SillyTavern extension that connects active conversations to AIOS.** It synchronizes the SillyTavern conversation, character identity, and source message history with AIOS, then retrieves the current AIOS **HUD** before generation and injects it into the SillyTavern prompt. This lets SillyTavern use AIOS-managed persistent memory, knowledge, world state, relationships, recent events, and other runtime context without duplicating that logic inside the extension. SillyTavern remains the chat and generation interface; MemoryVaultIngest is the bridge to AIOS.
+MemoryVaultIngest connects SillyTavern conversations to AIOS. SillyTavern owns the interface and model generation; AIOS owns persistent memory, identity, knowledge, world state, research, and HUD assembly.
 
-> **Status:** Experimental and under active development.
->
-> **Requires:** SillyTavern and a reachable AIOS API.
+**0.9.1 — experimental API integration branch.** Requires a reachable AIOS installation with the corresponding `AIOS-development` endpoints. This branch does not modify AIOS or the extension's `main` branch.
 
-## Install
+## Install this branch
 
-### Install through SillyTavern
-
-1. Open **SillyTavern**.
-2. Open **Extensions**.
-3. Select **Install Extension**.
-4. Enter:
+Use SillyTavern's extension installer with:
 
 ```text
 https://github.com/LeetHappyfeet/extension-MemoryVaultIngest
 ```
 
-5. Install the extension.
-6. Reload SillyTavern.
-
-MemoryVaultIngest should now appear in the SillyTavern extension settings.
-
-### Manual installation
-
-For development, clone the repository into SillyTavern's third-party extension directory.
-
-From the SillyTavern installation directory:
+Choose `feature/aios-api-integration` as the branch where supported. Alternatively, from an existing extension checkout:
 
 ```bash
-cd public/scripts/extensions/third-party
-git clone https://github.com/LeetHappyfeet/extension-MemoryVaultIngest.git MemoryVaultIngest
+git fetch origin
+git switch --track origin/feature/aios-api-integration
 ```
 
-The resulting directory should look like:
-
-```text
-SillyTavern/
-└── public/
-    └── scripts/
-        └── extensions/
-            └── third-party/
-                └── MemoryVaultIngest/
-                    ├── index.js
-                    ├── manifest.json
-                    └── ...
-```
-
-On Windows, a typical installation path is:
-
-```text
-C:\SillyTavern\public\scripts\extensions\third-party\MemoryVaultIngest
-```
-
-Restart SillyTavern or perform a hard browser refresh after installing or updating the extension.
-
-## Configure
-
-Open **MemoryVault Ingest** in the SillyTavern extension settings.
-
-Set **AIOS API Root** to the address of the AIOS API.
-
-For AIOS running on the same machine:
-
-```text
-http://127.0.0.1:8000
-```
-
-For AIOS running on another machine on the local network:
-
-```text
-http://<AIOS-IP>:8000
-```
-
-For example:
-
-```text
-http://192.168.1.50:8000
-```
-
-The extension will test the connection and display the current AIOS connection state.
-
-The default settings are suitable for initial use. Additional controls are available for HUD token budget, recent-event limits, HUD preparation timing, generation wait budget, retries, cached-HUD use, transcript reconciliation, prompt placement, `<aios_hud>` wrapping, and HUD console logging.
-
-## Run
-
-Once MemoryVaultIngest is enabled and connected to AIOS, use SillyTavern normally.
-
-Open a character and start or load a conversation. MemoryVaultIngest automatically connects the conversation to AIOS:
-
-```text
-SillyTavern conversation
-        ↓
-AIOS session
-        ↓
-conversation ingestion
-        ↓
-character runtime
-        ↓
-AIOS HUD
-        ↓
-SillyTavern prompt
-        ↓
-LLM generation
-```
-
-Existing messages can be reconciled with AIOS when a conversation is opened. New user and character messages are synchronized as the conversation continues.
-
-Before generation, MemoryVaultIngest requests the HUD corresponding to the current conversation state and injects the returned HUD into the SillyTavern prompt.
-
-There is no separate MemoryVaultIngest process to launch.
-
-## Live AIOS path
-
-The normal live request path is:
-
-```text
-POST /session
-        ↓
-POST /ingest
-        ↓
-POST /character/{character_id}/activate
-        ↓
-POST /instance/{instance_id}/hud?through_node_id=<node_id>
-        ↓
-HUD prompt injection
-```
-
-`POST /instance/{instance_id}/hud` is the canonical AIOS read path used for live generation.
-
-MemoryVaultIngest is intentionally a thin client. SillyTavern owns the conversation interface and generation workflow. AIOS owns persistent memory, semantic state, character and world state, timelines, provenance, retrieval, and HUD assembly.
-
-## Conversation identity
-
-MemoryVaultIngest supplies a stable external identity for each SillyTavern conversation:
-
-```text
-chat:<chatId>
-group:<groupId>
-```
-
-This allows the same SillyTavern conversation to reconnect to its AIOS session after a browser reload or extension restart.
-
-Individual messages also carry their SillyTavern source message identity so repeated text, edits, and alternate swipes can remain distinguishable in AIOS history.
-
-## Failure behavior
-
-MemoryVaultIngest is designed to fail open.
-
-If AIOS is unavailable or cannot return a suitable HUD within the configured generation window, SillyTavern can continue generating without AIOS context rather than hanging indefinitely.
-
-The extension does not fall back to obsolete AIOS memory or frame endpoints to construct a substitute HUD.
-
-## Diagnostics
-
-MemoryVaultIngest reports bridge activity in the browser console. Typical states include:
-
-```text
-DISCONNECTED
-SESSION_RESOLVED
-SYNCING
-RUNTIME_ACTIVE
-HUD_PREPARING
-READY
-DEGRADED
-```
-
-Diagnostics can also include AIOS session IDs, runtime instance IDs, source node IDs, HUD freshness, request failures, retry behavior, cache activity, and the returned HUD prompt when HUD logging is enabled.
-
-## Update
-
-If MemoryVaultIngest was installed through SillyTavern's extension manager, use SillyTavern's normal extension update controls.
-
-For a manual Git installation:
+For a new manual installation from SillyTavern's third-party extension directory:
 
 ```bash
-cd public/scripts/extensions/third-party/MemoryVaultIngest
-git pull
+git clone --branch feature/aios-api-integration https://github.com/LeetHappyfeet/extension-MemoryVaultIngest.git MemoryVaultIngest
 ```
 
-Reload SillyTavern afterward. A hard browser refresh is recommended after JavaScript changes.
+Keep the installed directory named **MemoryVaultIngest** so the extension template resolves correctly. Reload SillyTavern after changing branches or updating.
 
-## Current scope
+Configure **AIOS URL** under the extension settings, for example `http://127.0.0.1:8000` or `http://<AIOS-IP>:8000`. The connection indicator checks HTTP availability only; the separate runtime status reports HUD readiness.
 
-Single-character SillyTavern conversations are currently the best-tested path.
+## 0.9.1 compatibility fix
 
-Group conversation identity and metadata are supported, but richer multi-character behavior depends on the corresponding AIOS runtime and group semantics.
+Native browser `fetch` is bound to its global Window receiver. This fixes Firefox’s “does not implement interface Window” error during connection, ingestion, and HUD requests. A receiver-sensitive regression test covers the default browser transport.
+
+## What is new
+
+### Durable session and runtime mapping
+
+Chat metadata stores server-specific session, instance, entity, world, timeline, state-version, identity-version, source-head, and per-message receipt information. Activation is resolved again after reconnect; stored instance IDs are not blindly trusted.
+
+Character IDs preserve the existing normalized-name convention on first connection, then persist in the card's `data.extensions.MemoryVaultIngest.character_id` when SillyTavern supports card writes. Avatar-keyed settings provide a local mapping fallback. The human actor ID is retained for the chat; changing the displayed persona name does not silently create a new human actor.
+
+Existing solo conversations retain `chat:<chatId>` source keys. Group chats use `group:<groupId>:chat:<chatId>:view:<characterId>` source sessions with a shared world. Each responding character reconciles its own transcript perspective, with the actual speaker and viewpoint preserved. Group perspectives include a common per-message evidence correlation key. This avoids cross-character source-slot replacement; full multi-party epistemic behavior still depends on AIOS's downstream implementation.
+
+Ingestion is serialized per perspective. Full receipts distinguish historical replay nodes from the active server source head. Metadata includes the original speaker label, timestamps, generation times, backend, model, message UUID, and selected swipe. Reasoning content is not forwarded.
+
+### Strict live HUD integration
+
+Live context uses only:
+
+```text
+POST /instance/{instance_id}/hud?through_node_id=...
+```
+
+A generation-ready response must match the active instance and exact source coordinate. Cached HUDs from previous source nodes are not injected. Background preparation is single-flight per coordinate, and stale completions are discarded. Generation waits are bounded and fail open: SillyTavern can continue without AIOS context. Quiet and impersonation generations do not receive this character's HUD. Generation-stop and chat-switch events clear injection and cancel the generation wait.
+
+Settings show the structured HUD and freshness returned by the same request. There are no legacy `/memory` or `/frame` fallbacks. The old option to inject a not-ready HUD has been removed.
+
+### Character identity
+
+Automatic card synchronization fills missing authored facets without replacing existing facets. It imports appearance, personality, example dialogue, and explicit AIOS domain metadata. Scenario and greeting text remain outside durable identity.
+
+Controls also support staging a card without accepting it, explicitly replacing overlapping facets, inspecting identity/candidates/revisions, and accepting or rejecting a candidate. A staged card is not automatically accepted by the next inspection or reconnect. Explicitly import missing facets or replace overlaps when ready. Removing a card field does not delete a previously accepted facet; the backend does not provide full mirror semantics.
+
+### Scoped memory recall
+
+Search memory using a short keyword or phrase. Requests always include the active `instance_id`, include conflicts, and limit results to eight. AIOS currently implements this endpoint with substring matching, not semantic similarity.
+
+The optional **Offer AIOS recall as a model tool** checkbox registers `aios_recall`. This also requires a compatible Chat Completion model/backend and enabled SillyTavern function calling. The tool only searches existing instance knowledge; it does not initiate research or grant knowledge.
+
+### Research dossiers
+
+Open/list dossiers, inspect exposed source excerpts, advance discovery, add follow-up questions, submit one or two selected sections for study, and pause/resume/close where the backend permits.
+
+Advance and study requests persist UUID retry IDs before submission. Timeouts and pending responses retain those IDs across reloads; successful completed operations receive new IDs for subsequent work. Discovery is exposure, not durable knowledge. Study submits selected material to ingestion; it does not claim that knowledge projection has finished.
+
+The existing `<aios_action>{"op":"research","question":"..."}</aios_action>` live character-render path remains supported. Dispatch receipts, including dossier IDs, are retained. Bulk reconciliation does not automatically dispatch historical research requests. The backend remains responsible for validating the current character-authored source node and viewpoint. Native research-tool dispatch is not substituted for that provenance contract.
+
+### Reference resources
+
+Explicitly select a UTF-8 text file, paste text, or import the most recently activated lorebook entries. Imports use `/corpus/document`, deduplicate through AIOS, and remain cold reference material. Files are limited to 4 MB and imported text to two million characters. Nothing is imported automatically, and merely importing lore does not assert world facts or grant character knowledge.
+
+AIOS source profiles/access configuration determine whether an imported resource is available for research. Generic corpus section listing and retry-safe direct consumption are not implemented here; the plugin uses the dossier study workflow for exposed sections. Binary/PDF extraction and automatic Data Bank synchronization are outside this branch.
+
+### Tasks, attention, actions, and diagnostics
+
+Queue an explicit planning, reflection, research, executive, or communication task. Tasks are left to AIOS's scheduler; the plugin does not run them repeatedly. Creation has no backend idempotency contract, so task requests are not automatically retried. After a timeout, check AIOS before submitting again.
+
+Send an explicit attention event through the integration-event gateway. This registers the `memoryvaultingest` integration and submits a deduplicated event/wake. It does not ingest dialogue or create a memory observation, and no callback URL is registered.
+
+Explicit runtime actions refresh state, submit `expected_state_version`, and surface conflicts without automatic retries. `move` commits location state; `inspect`, `use_item`, and `wait` record intent and do not implement arbitrary inspection or item effects.
+
+Diagnostics expose `/agent/runtime/versions` and knowledge atlas health. Optional endpoints unavailable on an older backend report their HTTP errors in the operation result.
+
+## Transcript edits, deletions, and copied chats
+
+Normal edits and swipe selection continue using AIOS's source-slot replacement behavior. Stable message UUIDs are saved with the transcript and used to detect shifted/reordered slots.
+
+**The current API has no general transcript retraction endpoint.** Message deletion, swipe removal, or detected slot reordering blocks further synchronization and HUD injection for that conversation. The block is persisted across reloads. SillyTavern remains usable without AIOS context. Start a new chat to continue AIOS synchronization; this branch does not erase backend history or pretend that missing messages were retracted. Operations that SillyTavern implements by deleting messages, including some regeneration paths, can trigger this block.
+
+A copied chat that inherited another chat's metadata does not silently reconnect to its source session. Use **Connect copied chat independently** under Diagnostics to create a separate session and replay its retained transcript. This is not a historical AIOS state fork. Chat rename events update the stored chat binding while retaining the source-session key.
+
+## API coverage
+
+| Feature | Endpoints |
+|---|---|
+| Conversation and live state | `/session`, `/ingest`, `/character/{id}/activate`, `/instance/{id}/state`, `/instance/{id}/hud` |
+| Identity | `/character/{id}/identity/bootstrap/card`, `/character/{id}/identity`, `/character/{id}/identity/candidate/{candidate_id}/accept`, `/reject` |
+| Recall | `/epistemic/search` |
+| Research | `/agent/instance/{id}/research`, `/{dossier_id}`, `/advance`, `/question`, `/study`, `/status`, `/tool-request` |
+| Resources | `/corpus/document` |
+| Task and attention | `/agent/instance/{id}/task`, `/agent/integrations`, `/agent/integrations/{key}/event` |
+| Runtime actions | `/instance/{id}/action` |
+| Diagnostics | `/healthz`, `/agent/runtime/versions`, `/agent/knowledge-atlas/health` |
+
+Historical forks, automatic world-entity creation, arbitrary world-fact promotion, remote-worker claims, and direct document acquisition remain deferred. They need stronger backend semantics, routing, or retry contracts before automatic client use.
+
+## Development checks
+
+No build step or runtime npm dependencies are required. With Node.js 20 or newer:
+
+```bash
+npm run check
+npm test
+```
+
+Optional HTTP/UI smoke tests use mock SillyTavern modules and a local mock AIOS server:
+
+```bash
+npm install --no-save playwright
+npx playwright install chromium --only-shell
+node scripts/browser-smoke.mjs
+```
+
+For a DOM integration run without Chromium:
+
+```bash
+npm install --no-save jsdom
+MVI_DOM=1 node scripts/browser-smoke.mjs
+```
+
+These validate client contracts and controls; they do not replace testing inside a real SillyTavern installation against your running AIOS database. The browser smoke script can save an intermediate screenshot when `MVI_SCREENSHOT` is set.
