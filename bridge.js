@@ -1,6 +1,6 @@
 // Transport-independent AIOS client. No SillyTavern imports: exercised with mock HTTP.
 export const MODULE = 'MemoryVaultIngest';
-export const VERSION = '0.9.0';
+export const VERSION = '0.9.1';
 export const defaults = {
     enabled: true, apiRoot: 'http://192.168.1.217:8000', position: 1, depth: 1,
     recentLimit: 12, tokenBudget: 4000, prepareWaitMs: 1200, generationBudgetMs: 900,
@@ -121,7 +121,8 @@ export function exactHud(cache, runtime, head) {
     return Boolean(head && cache?.generation_ready && cache.instance_id === runtime.instance_id && cache.node === head);
 }
 export class AIOSBridge {
-    constructor({ getContext, settings, fetchImpl = globalThis.fetch, onChange = () => {} }) {
+    // Native browser fetch requires Window as its receiver (not this bridge).
+    constructor({ getContext, settings, fetchImpl = globalThis.fetch.bind(globalThis), onChange = () => {} }) {
         Object.assign(this, { getContext, settings, fetchImpl, onChange });
         this.live = new Map();
         this.connections = new SerialQueue();

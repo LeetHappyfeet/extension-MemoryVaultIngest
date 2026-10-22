@@ -2,7 +2,7 @@
 
 MemoryVaultIngest connects SillyTavern conversations to AIOS. SillyTavern owns the interface and model generation; AIOS owns persistent memory, identity, knowledge, world state, research, and HUD assembly.
 
-**0.9.0 — experimental API integration branch.** Requires a reachable AIOS installation with the corresponding `AIOS-development` endpoints. This branch does not modify AIOS or the extension's `main` branch.
+**0.9.1 — experimental API integration branch.** Requires a reachable AIOS installation with the corresponding `AIOS-development` endpoints. This branch does not modify AIOS or the extension's `main` branch.
 
 ## Install this branch
 
@@ -28,6 +28,10 @@ git clone --branch feature/aios-api-integration https://github.com/LeetHappyfeet
 Keep the installed directory named **MemoryVaultIngest** so the extension template resolves correctly. Reload SillyTavern after changing branches or updating.
 
 Configure **AIOS URL** under the extension settings, for example `http://127.0.0.1:8000` or `http://<AIOS-IP>:8000`. The connection indicator checks HTTP availability only; the separate runtime status reports HUD readiness.
+
+## 0.9.1 compatibility fix
+
+Native browser `fetch` is bound to its global Window receiver. This fixes Firefox’s “does not implement interface Window” error during connection, ingestion, and HUD requests. A receiver-sensitive regression test covers the default browser transport.
 
 ## What is new
 

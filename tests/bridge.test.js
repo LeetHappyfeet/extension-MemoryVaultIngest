@@ -286,3 +286,15 @@ test('explicit state invalidation rejects in-flight HUD even at the same source 
     assert.equal(await pending, null);
     assert.equal(scope.live.cache, null);
 });
+
+test('default browser fetch is called with the Window/global receiver', async t => {
+    const calls = [];
+    t.mock.method(globalThis, 'fetch', function (url, options) {
+        if (this !== globalThis) throw new TypeError("'fetch' called on an object that does not implement interface Window.");
+        calls.push({ url, method: options.method });
+        return Promise.resolve(response({ ok: true }));
+    });
+    const bridge = new AIOSBridge({ getContext: () => ({}), settings: () => ({ ...defaults }) });
+    assert.deepEqual(await bridge.request('http://aios.test', '/healthz'), { ok: true });
+    assert.deepEqual(calls, [{ url: 'http://aios.test/healthz', method: 'GET' }]);
+});
