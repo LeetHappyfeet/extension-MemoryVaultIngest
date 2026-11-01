@@ -298,3 +298,150 @@ test('default browser fetch is called with the Window/global receiver', async t 
     assert.deepEqual(await bridge.request('http://aios.test', '/healthz'), { ok: true });
     assert.deepEqual(calls, [{ url: 'http://aios.test/healthz', method: 'GET' }]);
 });
+
+test('23-message incremental reconciliation survives reconnect and only sends appended messages', async () => {
+    const f = fixture();
+    f.ctx.chat = Array.from({ length: 23 }, (_, i) => ({ mes: `Message ${i}`, is_user: true }));
+    await f.bridge.reconcile(f.scope());
+    await f.bridge.reconcile(f.scope());
+    f.bridge.reset();
+    await f.bridge.reconcile(f.scope());
+    assert.equal(f.calls.filter(c => c.path === '/ingest').length, 23);
+    f.ctx.chat.push({ mes: 'New', is_user: true });
+    await f.bridge.reconcile(f.scope());
+    assert.equal(f.calls.filter(c => c.path === '/ingest').length, 24);
+});
+
+test('edits, same-text swipe changes, and speaker changes invalidate receipts', async () => {
+    const f = fixture();
+    f.ctx.chat = [{ mes: 'One', is_user: true }, { mes: 'Two', name: 'Renamon', swipe_id: 0 }];
+    await f.bridge.reconcile(f.scope());
+    f.ctx.chat[0].mes = 'Edited';
+    await f.bridge.reconcile(f.scope());
+    f.ctx.chat[1].swipe_id = 1;
+    await f.bridge.reconcile(f.scope());
+    f.ctx.chat[1].is_user = true;
+    await f.bridge.reconcile(f.scope());
+    assert.deepEqual(f.calls.filter(c => c.path === '/ingest').map(c => [c.body.text, c.body.speaker_id, c.body.payload.swipe_id]),
+        [['One', 'Mia', null], ['Two', 'Renamon', 0], ['Edited', 'Mia', null], ['Two', 'Renamon', 1], ['Two', 'Mia', 1]]);
+});
+
+test('missing or mismatched checkpoint conservatively replays every message', async () => {
+    let reset = false;
+    const f = fixture({ handle: path => reset && path.endsWith('/state') ? response({ source_head_node_id: null }) : undefined });
+    f.ctx.chat = [{ mes: 'One', is_user: true }, { mes: 'Two', is_user: true }];
+    await f.bridge.reconcile(f.scope());
+    reset = true;
+    f.bridge.reset();
+    await f.bridge.reconcile(f.scope());
+    assert.equal(f.calls.filter(c => c.path === '/ingest').length, 4);
+    delete f.scope().data.sync_checkpoint;
+    reset = false;
+    f.bridge.reset();
+    await f.bridge.reconcile(f.scope());
+    assert.equal(f.calls.filter(c => c.path === '/ingest').length, 6);
+});
+
+test('overlapping reconciliation coalesces and includes edits during an active pass', async () => {
+    let release, entered;
+    const ready = new Promise(resolve => { entered = resolve; });
+    const f = fixture({ handle: path => path === '/ingest' && !release ? new Promise(resolve => { release = resolve; entered(); }) : undefined });
+    f.ctx.chat = [{ mes: 'Before', is_user: true }];
+    const scope = f.scope();
+    const first = f.bridge.reconcile(scope);
+    await ready;
+    f.ctx.chat[0].mes = 'After';
+    f.ctx.chat.push({ mes: 'Added', is_user: true });
+    const second = f.bridge.reconcile(scope);
+    assert.equal(first, second);
+    release(response({ node_id: 'initial', source_head_node_id: 'initial' }));
+    await first;
+    assert.deepEqual(f.calls.filter(c => c.path === '/ingest').map(c => c.body.text), ['Before', 'After', 'Added']);
+});
+
+test('changes received during the receipt save are not dropped', async () => {
+    const f = fixture();
+    f.ctx.chat = [{ mes: 'Before', is_user: true }];
+    const scope = f.scope();
+    await f.bridge.reconcile(scope);
+    f.ctx.chat[0].mes = 'Trigger receipt save';
+    let changed = false;
+    f.ctx.saveMetadata = async () => {
+        if (!changed) {
+            changed = true;
+            f.ctx.chat[0].mes = 'During save';
+            void f.bridge.reconcile(scope);
+        }
+    };
+    await f.bridge.reconcile(scope);
+    assert.equal(f.calls.filter(c => c.path === '/ingest').at(-1).body.text, 'During save');
+});
+
+test('receipt saves are batched and failed passes preserve acknowledged progress', async () => {
+    let fail = false;
+    const f = fixture({ handle: (path, body) => fail && path === '/ingest' && body.text === 'Fail' ? response({}, 400) : undefined });
+    const scope = f.scope();
+    await f.bridge.connect(scope);
+    let saves = 0;
+    f.ctx.saveMetadata = async () => { saves++; };
+    f.ctx.chat = Array.from({ length: 23 }, (_, i) => ({ mes: `Message ${i}`, is_user: true }));
+    await f.bridge.reconcile(scope);
+    assert.equal(saves, 2, 'one UUID save and one receipt checkpoint save');
+    await f.bridge.reconcile(scope);
+    assert.equal(saves, 2, 'unchanged reconciliation does not save the chat');
+    fail = true;
+    f.ctx.chat.push({ mes: 'Acknowledged', is_user: true }, { mes: 'Fail', is_user: true });
+    await assert.rejects(f.bridge.reconcile(scope), /400/);
+    assert.ok(scope.data.receipts[23].node_id);
+    assert.equal(scope.data.receipts[24], undefined);
+    fail = false;
+    await f.bridge.reconcile(scope);
+    assert.equal(f.calls.filter(c => c.path === '/ingest' && c.body.text === 'Acknowledged').length, 1);
+});
+
+test('generation refreshes same-head HUD task overlays without replaying ingestion', async () => {
+    let hud = 'Before completion';
+    const f = fixture({ handle: path => path.endsWith('/hud') ? response({ instance_id: 'instance-Renamon', generation_ready: true, text: hud }) : undefined });
+    f.ctx.chat = [{ mes: 'Task', is_user: true }];
+    const scope = f.scope();
+    await f.bridge.reconcile(scope);
+    await f.bridge.prefetch(scope);
+    hud = 'Task completed';
+    const result = await f.bridge.generationHud(scope, new AbortController().signal);
+    assert.equal(result.text, 'Task completed');
+    assert.equal(f.calls.filter(c => c.path === '/ingest').length, 1);
+    assert.equal(f.calls.filter(c => c.path.endsWith('/hud')).length, 2);
+});
+
+test('generation discards HUD when the transcript changes during retrieval', async () => {
+    let release, entered;
+    const ready = new Promise(resolve => { entered = resolve; });
+    const f = fixture({ handle: path => path.endsWith('/hud') ? new Promise(resolve => { release = resolve; entered(); }) : undefined });
+    f.ctx.chat = [{ mes: 'Before', is_user: true }];
+    const scope = f.scope();
+    const result = f.bridge.generationHud(scope, new AbortController().signal);
+    await ready;
+    f.ctx.chat[0].mes = 'After';
+    release(response({ instance_id: scope.data.instance_id, generation_ready: true, text: 'Stale' }));
+    assert.equal(await result, null);
+});
+
+test('incremental skipping preserves live research dispatch after reconciliation', async () => {
+    const f = fixture();
+    f.ctx.chat = [{ mes: '<aios_action>{"op":"research","question":"Rice?"}</aios_action>', name: 'Renamon' }];
+    const scope = f.scope();
+    await f.bridge.reconcile(scope);
+    await f.bridge.submit(scope, 0, f.ctx.chat[0], { dispatchResearch: true });
+    await f.bridge.submit(scope, 0, f.ctx.chat[0], { dispatchResearch: true });
+    assert.equal(f.calls.filter(c => c.path === '/ingest').length, 1);
+    assert.equal(f.calls.filter(c => c.path.endsWith('/research/tool-request')).length, 1);
+});
+
+
+test('stale chat work is rejected even if SillyTavern reuses the metadata object', async () => {
+    const f = fixture();
+    const scope = f.scope();
+    f.change({ ...f.ctx, chatId: 'different-chat' });
+    assert.equal(f.bridge.current(scope), false);
+    await assert.rejects(f.bridge.connect(scope), { name: 'AbortError' });
+});

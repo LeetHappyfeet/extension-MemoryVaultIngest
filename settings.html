@@ -55,11 +55,12 @@
   <div style="margin-top:10px;">
     <label for="mvi_generation_budget"><b>Generation wait budget (ms):</b></label>
     <input type="number" id="mvi_generation_budget" min="50" max="5000" step="50">
-    <small>Hard cap on how long MemoryVaultIngest may delay SillyTavern generation. The plugin fails open when the budget expires.</small>
+    <small>Includes transcript synchronization and HUD retrieval. New installations default to 4000 ms; existing saved budgets are preserved.</small>
   </div>
 
   <div style="margin-top:10px;">
-    <label><input type="checkbox" id="mvi_cached_hud"> Reuse a generation-ready HUD only for the exact active instance and source coordinate</label>
+    <label><input type="checkbox" id="mvi_require_hud"> Require an AIOS HUD before generation</label>
+    <small>If enabled, stop generation when the HUD is unavailable and retry after READY. Otherwise generation continues with a visible status. AIOS is contacted before every generation to refresh workspace results.</small>
   </div>
 
   <div style="margin-top:10px;">

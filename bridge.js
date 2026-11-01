@@ -1,12 +1,13 @@
 // Transport-independent AIOS client. No SillyTavern imports: exercised with mock HTTP.
 export const MODULE = 'MemoryVaultIngest';
-export const VERSION = '0.9.1';
+export const VERSION = '0.9.2';
 export const defaults = {
     enabled: true, apiRoot: 'http://192.168.1.217:8000', position: 1, depth: 1,
-    recentLimit: 12, tokenBudget: 4000, prepareWaitMs: 1200, generationBudgetMs: 900,
+    recentLimit: 12, tokenBudget: 4000, prepareWaitMs: 1200, generationBudgetMs: 4000,
     requestTimeoutMs: 10000, maxRetries: 1, retryDelayMs: 250,
     hudReadinessAttempts: 3, hudReadinessRetryDelayMs: 500,
-    useCachedHud: true, tagWrapper: true,
+    tagWrapper: true,
+    requireHud: false,
     reconcileOnChatLoad: true, logHudText: true, syncCards: true, nativeRecall: false,
 };
 export function normalizeRoot(value) {
@@ -204,6 +205,8 @@ export class AIOSBridge {
     }
     current(scope) {
         return scope.epoch === this.epoch && scope.metadata === this.getContext().chatMetadata &&
+            String(scope.saved.chat_id) === String(this.getContext().chatId) &&
+            String(scope.saved.group_id ?? '') === String(this.getContext().groupId ?? '') &&
             scope.root === normalizeRoot(this.settings().apiRoot) && this.settings().enabled;
     }
     assertCurrent(scope) {
@@ -211,7 +214,11 @@ export class AIOSBridge {
         if (scope.live.blocked) throw new Error(scope.live.blocked);
     }
     async save(scope) {
-        if (this.current(scope)) await scope.ctx.saveMetadata?.();
+        if (this.current(scope)) await this.getContext().saveMetadata?.();
+    }
+    checkpoint(scope) {
+        return { session_id: scope.data.session_id, instance_id: scope.data.instance_id,
+            head: scope.data.source_head_node_id || null };
     }
     invalidate(scope) {
         scope.live.cache = null;
@@ -272,15 +279,19 @@ export class AIOSBridge {
             scope.data.source_head_node_id = state.source_head_node_id || null;
             scope.data.source_timeline_id = state.source_timeline_id || null;
             scope.data.state_version = state.state_version;
+            const checkpoint = scope.data.sync_checkpoint;
+            scope.live.receiptsTrusted = !Object.keys(scope.data.receipts).length || Boolean(checkpoint?.head &&
+                checkpoint.session_id === scope.data.session_id && checkpoint.instance_id === scope.data.instance_id &&
+                checkpoint.head === scope.data.source_head_node_id);
             await this.save(scope);
         }
         this.status(scope, 'RUNTIME_ACTIVE', { instance_id: scope.data.instance_id });
         return scope.data;
     }
-    async ingest(scope, index, message, { dispatchResearch = false, signal } = {}) {
+    async ingest(scope, index, message, { dispatchResearch = false, signal, connected = false, deferSave = false, force = false } = {}) {
         if (!message?.mes || message.is_system) return null;
         this.assertCurrent(scope);
-        await this.connect(scope, { signal });
+        if (!connected) await this.connect(scope, { signal });
         const human = Boolean(message.is_user || message.sender === 'user');
         const speakerCard = human ? null : selectedCard(scope.ctx, message, this.drafted);
         const speaker = human ? scope.data.user_name :
@@ -292,8 +303,7 @@ export class AIOSBridge {
         }
         const textHash = await digest(message.mes);
         this.assertCurrent(scope);
-        const receipt = await this.request(scope.root, '/ingest', { method: 'POST', signal,
-            retries: Number(this.settings().maxRetries || 0), body: {
+        const body = {
                 session_id: scope.data.session_id, character_id: scope.data.character_id, user_name: scope.data.user_name,
                 speaker_id: speaker, speaker_type: human ? 'user' : 'character', viewpoint_id: speaker,
                 recipient_id: hasGroup(scope.ctx) ? null : human ? scope.data.character_id : scope.data.user_name,
@@ -305,13 +315,25 @@ export class AIOSBridge {
                     gen_finished: message.gen_finished ?? null, model: message.extra?.model ?? null,
                     api: message.extra?.api ?? null,
                     evidence_correlation_key: `sillytavern:${scope.saved.conversationKey}:${index}:${textHash}` },
-            } });
+            };
+        // Hash the actual wire data, including speaker, swipe, and provenance fields.
+        const fingerprint = await digest(JSON.stringify(body));
         this.assertCurrent(scope);
-        scope.data.receipts[index] = { ...receipt, text_hash: textHash, speaker_id: speaker, message_uuid: message[MODULE]?.message_id };
-        scope.data.source_head_node_id = receiptHead(receipt, scope.data.source_head_node_id);
-        scope.data.source_timeline_id = receipt.timeline_id || scope.data.source_timeline_id;
-        await this.save(scope);
-        if (dispatchResearch && !human && speaker === scope.data.character_id && receipt.source_current !== false &&
+        const unchanged = !force && scope.live.receiptsTrusted && prior?.node_id && prior.fingerprint === fingerprint;
+        let receipt = prior;
+        if (!unchanged) {
+            this.invalidate(scope);
+            receipt = await this.request(scope.root, '/ingest', { method: 'POST', signal,
+                retries: Number(this.settings().maxRetries || 0), body });
+            this.assertCurrent(scope);
+            scope.data.receipts[index] = { ...receipt, fingerprint, text_hash: textHash, speaker_id: speaker, message_uuid: message[MODULE]?.message_id };
+            scope.live.receiptRevision = (scope.live.receiptRevision || 0) + 1;
+            scope.data.source_head_node_id = receiptHead(receipt, scope.data.source_head_node_id);
+            scope.data.source_timeline_id = receipt.timeline_id || scope.data.source_timeline_id;
+            if (scope.live.receiptsTrusted) scope.data.sync_checkpoint = this.checkpoint(scope);
+            if (!deferSave) await this.save(scope);
+        }
+        if (dispatchResearch && !scope.data.receipts[index].research_dispatched && !human && speaker === scope.data.character_id && receipt.source_current !== false &&
             /<aios_action>[\s\S]*?<\/aios_action>/i.test(message.mes)) {
             try {
                 const result = await this.request(scope.root, `/agent/instance/${scope.data.instance_id}/research/tool-request`, {
@@ -319,6 +341,7 @@ export class AIOSBridge {
                 });
                 this.assertCurrent(scope);
                 scope.data.last_research = result;
+                scope.data.receipts[index].research_dispatched = true;
                 await this.save(scope);
             } catch (error) { this.status(scope, 'RESEARCH_ERROR', { error: error.message }); }
         }
@@ -326,36 +349,74 @@ export class AIOSBridge {
     }
     // Snapshot before enqueueing so edits after an event do not mutate its request.
     stamp(message) {
-        if (!message?.mes || message.is_system) return;
+        if (!message?.mes || message.is_system) return false;
         message[MODULE] ||= {};
-        message[MODULE].message_id ||= uuid();
+        if (message[MODULE].message_id) return false;
+        message[MODULE].message_id = uuid();
+        return true;
     }
     submit(scope, index, message, options = {}) {
-        this.stamp(message);
+        const stamped = this.stamp(message);
         const copy = structuredClone(message);
         return scope.live.queue.run(async () => {
             this.assertCurrent(scope);
-            await scope.ctx.saveChat?.();
+            if (stamped) await this.save(scope);
             return this.ingest(scope, index, copy, options);
         });
     }
     reconcile(scope) {
-        for (const message of scope.ctx.chat || []) this.stamp(message);
-        const chat = structuredClone(scope.ctx.chat || []);
-        return scope.live.queue.run(async () => {
+        // Capture each trigger immediately. A trigger during a pass replaces the
+        // pending snapshot; it must not disappear behind a single-flight promise.
+        let stamped = false;
+        for (const message of scope.ctx.chat || []) stamped = this.stamp(message) || stamped;
+        scope.live.reconcilePending = structuredClone(scope.ctx.chat || []);
+        scope.live.stampsDirty ||= stamped;
+        if (scope.live.reconcilePromise) return scope.live.reconcilePromise;
+        const promise = scope.live.queue.run(async () => {
             this.assertCurrent(scope);
             this.status(scope, 'SYNCING');
-            await scope.ctx.saveChat?.();
+            if (scope.live.stampsDirty) { scope.live.stampsDirty = false; await this.save(scope); }
             await this.connect(scope);
-            // Positional slots cannot safely express removals or reordered messages.
-            if (Object.keys(scope.data.receipts).some(index => !chat[Number(index)]?.mes || chat[Number(index)].is_system ||
-                (scope.data.receipts[index].message_uuid && scope.data.receipts[index].message_uuid !== chat[Number(index)][MODULE]?.message_id))) {
-                this.block(scope, 'Transcript removal needs AIOS retraction support. Start a new chat to continue AIOS synchronization.');
-                throw new Error(scope.live.blocked);
+            while (scope.live.reconcilePending) {
+                const chat = scope.live.reconcilePending;
+                scope.live.reconcilePending = null;
+                const previousCheckpoint = JSON.stringify(scope.data.sync_checkpoint);
+                const receiptRevision = scope.live.receiptRevision || 0;
+                const force = !scope.live.receiptsTrusted;
+                if (force) delete scope.data.sync_checkpoint;
+                try {
+                    if (scope.live.stampsDirty) {
+                        scope.live.stampsDirty = false;
+                        await this.save(scope);
+                    }
+                    // Positional slots cannot safely express removals or reordered messages.
+                    if (Object.keys(scope.data.receipts).some(index => !chat[Number(index)]?.mes || chat[Number(index)].is_system ||
+                        (scope.data.receipts[index].message_uuid && scope.data.receipts[index].message_uuid !== chat[Number(index)][MODULE]?.message_id))) {
+                        this.block(scope, 'Transcript removal needs AIOS retraction support. Start a new chat to continue AIOS synchronization.');
+                        throw new Error(scope.live.blocked);
+                    }
+                    for (let index = 0; index < chat.length; index++) {
+                        await this.ingest(scope, index, chat[index], { connected: true, deferSave: true, force });
+                    }
+                    this.assertCurrent(scope);
+                    scope.live.receiptsTrusted = true;
+                    scope.data.sync_checkpoint = this.checkpoint(scope);
+                } finally {
+                    // Persist acknowledged progress even if a later request fails.
+                    // Changes received during this save are handled by the next pass.
+                    if (receiptRevision !== (scope.live.receiptRevision || 0) ||
+                        previousCheckpoint !== JSON.stringify(scope.data.sync_checkpoint)) await this.save(scope);
+                }
             }
-            for (let index = 0; index < chat.length; index++) await this.ingest(scope, index, chat[index]);
             return scope.data.source_head_node_id;
+        }).finally(() => {
+            if (scope.live.reconcilePromise === promise) {
+                scope.live.reconcilePromise = null;
+                scope.live.reconcilePending = null;
+            }
         });
+        scope.live.reconcilePromise = promise;
+        return promise;
     }
     block(scope, reason) {
         scope.live.blocked = reason;
@@ -374,6 +435,7 @@ export class AIOSBridge {
             scope.data.source_head_node_id = state.source_head_node_id || null;
             scope.data.source_timeline_id = state.source_timeline_id || null;
             scope.data.state_version = state.state_version;
+            scope.live.receiptsTrusted = false;
             this.invalidate(scope);
             await this.save(scope);
             return state;
@@ -428,14 +490,23 @@ export class AIOSBridge {
     }
     async generationHud(scope, signal) {
         this.assertCurrent(scope);
+        // A local scan catches changes missed by events. Historical research
+        // actions remain undispatched during reconciliation.
+        if (this.settings().reconcileOnChatLoad) await this.reconcile(scope);
         await scope.live.queue.tail;
         this.assertCurrent(scope);
         if (signal.aborted) return null;
         const node = scope.data.source_head_node_id;
-        if (this.settings().useCachedHud && exactHud(scope.live.cache, scope.data, node)) return scope.live.cache;
-        const result = await this.prefetch(scope);
+        if (!node) return null;
+        const queueBoundary = scope.live.queue.tail;
+        const transcript = JSON.stringify(this.getContext().chat);
+        // A matching chat head cannot prove that task overlays are fresh.
+        // Always call AIOS; it can reuse its cognitive frame internally.
+        this.invalidate(scope);
+        const result = await this.prepareHud(scope, node, signal);
         this.assertCurrent(scope);
-        return !signal.aborted && exactHud(result, scope.data, scope.data.source_head_node_id) ? result : null;
+        return !signal.aborted && queueBoundary === scope.live.queue.tail && transcript === JSON.stringify(this.getContext().chat) &&
+            exactHud(result, scope.data, scope.data.source_head_node_id) ? result : null;
     }
     async feature(scope, suffix, { method = 'GET', body, timeoutMs } = {}) {
         return scope.live.queue.run(async () => {

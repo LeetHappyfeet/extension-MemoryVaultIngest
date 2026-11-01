@@ -2,7 +2,7 @@
 
 MemoryVaultIngest connects SillyTavern conversations to AIOS. SillyTavern owns the interface and model generation; AIOS owns persistent memory, identity, knowledge, world state, research, and HUD assembly.
 
-**0.9.1 — experimental API integration branch.** Requires a reachable AIOS installation with the corresponding `AIOS-development` endpoints. This branch does not modify AIOS or the extension's `main` branch.
+**0.9.2 — incremental synchronization development branch.** Requires a reachable AIOS installation with the corresponding `AIOS-development` endpoints. This branch does not modify AIOS or the extension's `main` branch.
 
 ## Install this branch
 
@@ -12,22 +12,30 @@ Use SillyTavern's extension installer with:
 https://github.com/LeetHappyfeet/extension-MemoryVaultIngest
 ```
 
-Choose `feature/aios-api-integration` as the branch where supported. Alternatively, from an existing extension checkout:
+Choose `development` as the branch where supported. Alternatively, from an existing extension checkout:
 
 ```bash
 git fetch origin
-git switch --track origin/feature/aios-api-integration
+git switch --track origin/development
 ```
 
 For a new manual installation from SillyTavern's third-party extension directory:
 
 ```bash
-git clone --branch feature/aios-api-integration https://github.com/LeetHappyfeet/extension-MemoryVaultIngest.git MemoryVaultIngest
+git clone --branch development https://github.com/LeetHappyfeet/extension-MemoryVaultIngest.git MemoryVaultIngest
 ```
 
 Keep the installed directory named **MemoryVaultIngest** so the extension template resolves correctly. Reload SillyTavern after changing branches or updating.
 
 Configure **AIOS URL** under the extension settings, for example `http://127.0.0.1:8000` or `http://<AIOS-IP>:8000`. The connection indicator checks HTTP availability only; the separate runtime status reports HUD readiness.
+
+## 0.9.2 synchronization changes
+
+Reconciliation scans locally and sends only missing or changed messages. Fingerprints include the complete ingestion payload, preserving speaker, selected swipe, and provenance changes. Overlapping passes share one queue operation and process the latest pending snapshot, including changes arriving during receipt persistence. A generation-time scan catches edits missed by event listeners when automatic reconciliation is enabled.
+
+Receipt checkpoints are scoped to the server URL, session, instance, and source head. Reconnect validates the checkpoint against AIOS state; legacy or mismatched checkpoints trigger a conservative full replay. This is a boundary check, not a server-side inventory of every event: detecting arbitrary server data loss while retaining the same head requires an AIOS synchronization endpoint. Concurrent writers to the same source session are not supported by this local checkpoint scheme.
+
+Bulk passes save message UUIDs before transmission and batch receipt persistence at the end of each pass, including on partial failure. An interrupted pass may replay already acknowledged messages through AIOS's idempotent ingestion path. Deletions, slot replacements, copied chats, and reordering retain their existing protective blocks. Historical research requests are not dispatched by bulk reconciliation.
 
 ## 0.9.1 compatibility fix
 
@@ -53,7 +61,7 @@ Live context uses only:
 POST /instance/{instance_id}/hud?through_node_id=...
 ```
 
-A generation-ready response must match the active instance and exact source coordinate. Cached HUDs from previous source nodes are not injected. Background preparation is single-flight per coordinate, and stale completions are discarded. Generation waits are bounded and fail open: SillyTavern can continue without AIOS context. Quiet and impersonation generations do not receive this character's HUD. Generation-stop and chat-switch events clear injection and cancel the generation wait.
+A generation-ready response must match the active instance and exact source coordinate. Every generation revalidates the HUD with AIOS, even at an unchanged source head, so newly completed workspace results are visible. The former local cache reuse setting is ignored. Background preparation is single-flight per coordinate, and stale completions are discarded. Generation waits include synchronization and HUD retrieval, defaulting to 4000 ms for new installations. Existing saved budgets are preserved. By default SillyTavern continues without AIOS context on failure, with a visible status. Enable **Require an AIOS HUD before generation** to stop generation instead and retry after READY. Quiet and impersonation generations do not receive this character's HUD. Generation-stop and chat-switch events clear injection and cancel the generation wait.
 
 Settings show the structured HUD and freshness returned by the same request. There are no legacy `/memory` or `/frame` fallbacks. The old option to inject a not-ready HUD has been removed.
 

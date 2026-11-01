@@ -18,6 +18,8 @@ const calls = [];
 const D = '00000000-0000-4000-8000-000000000001';
 const S = '00000000-0000-4000-8000-000000000002';
 let node = 0;
+let hudDelay = 0;
+let hudText = 'Character remembers rice.';
 let advanceFailed = false;
 let origin;
 const server = http.createServer(async (req, res) => {
@@ -36,7 +38,10 @@ const server = http.createServer(async (req, res) => {
             if (api.endsWith('/activate')) return json({ instance_id: `instance-${api.split('/')[2]}`, character_id: api.split('/')[2], world_id: 'world-test', entity_id: 'entity-test', state_version: 1, timeline_id: 'timeline-test' });
             if (api.endsWith('/state')) return json({ instance_id: api.split('/')[2], state_version: 1, source_head_node_id: node ? `node-${node}` : null });
             if (api === '/ingest') return json({ node_id: `node-${++node}`, source_head_node_id: `node-${node}`, source_current: true, disposition: 'new', timeline_id: 'source-timeline' });
-            if (api.endsWith('/hud')) return json({ instance_id: api.split('/')[2], generation_ready: true, text: 'Character remembers rice.', freshness: { ready: true }, frame: { goals: ['Learn cooking'] } });
+            if (api.endsWith('/hud')) {
+                if (hudDelay) await new Promise(resolve => setTimeout(resolve, hudDelay));
+                return json({ instance_id: api.split('/')[2], generation_ready: true, text: hudText, freshness: { ready: true }, frame: { goals: ['Learn cooking'] } });
+            }
             if (api === '/epistemic/search') return json({ results: [{ canonical_text: 'Rice is food', conflicts: [] }], instance_id: body.instance_id });
             if (api.endsWith('/research') && req.method === 'GET') return json({ dossiers: [{ dossier_id: D, status: 'open', question: 'How to cook?' }] });
             if (api.endsWith('/research') && req.method === 'POST') return json({ dossier_id: D, status: 'open' });
@@ -167,12 +172,33 @@ try {
     assert.equal(calls.find(c => c.api.endsWith('/action')).body.expected_state_version, 1);
     await page.evaluate(() => window.MemoryVaultIngest_Intercept([], 4096, () => {}, 'normal'));
     assert.match(await page.evaluate(() => window.prompts.at(-1)[1]), /Character remembers rice/);
+    const ingestsBefore = calls.filter(c => c.api === '/ingest').length;
+    hudText = 'Workspace task completed.';
+    await page.evaluate(() => window.MemoryVaultIngest_Intercept([], 4096, () => {}, 'normal'));
+    assert.match(await page.evaluate(() => window.prompts.at(-1)[1]), /Workspace task completed/);
+    assert.equal(calls.filter(c => c.api === '/ingest').length, ingestsBefore);
+    hudDelay = 200;
+    await page.locator('#mvi_generation_budget').fill('50');
+    await page.evaluate(() => document.getElementById('mvi_generation_budget').dispatchEvent(new window.Event('change')));
+    await page.locator('#mvi_require_hud').check();
+    await page.evaluate(async () => {
+        window.abortCount = 0;
+        await window.MemoryVaultIngest_Intercept([], 4096, () => window.abortCount++, 'normal');
+    });
+    assert.equal(await page.evaluate(() => window.abortCount), 1, 'required HUD aborts generation on timeout');
+    assert.equal(await page.evaluate(() => window.prompts.at(-1)[1]), '');
+    assert.match(await page.locator('#mvi_runtime_status').textContent(), /Generation stopped/);
+    await page.evaluate(() => document.getElementById('mvi_require_hud').click());
+    await page.evaluate(() => window.MemoryVaultIngest_Intercept([], 4096, () => window.abortCount++, 'normal'));
+    assert.equal(await page.evaluate(() => window.abortCount), 1, 'optional HUD continues generation on timeout');
+    assert.match(await page.locator('#mvi_runtime_status').textContent(), /continuing without AIOS context/);
+    hudDelay = 0;
     await page.evaluate(() => window.events.emit('MESSAGE_DELETED', 1));
     await page.evaluate(() => window.MemoryVaultIngest_Intercept([], 4096, () => {}, 'normal'));
     assert.equal(await page.evaluate(() => window.prompts.at(-1)[1]), '');
     assert.equal(errors.length, 0, errors.join('\n'));
     if (!process.env.MVI_DOM && process.env.MVI_SCREENSHOT) await page.screenshot({ path: process.env.MVI_SCREENSHOT, fullPage: true });
-    console.log(`${process.env.MVI_DOM ? 'DOM' : 'Browser'} smoke passed: initialization, recall, research retry/study, resources/lore, staged identity, native tool, task/event, runtime action, HUD injection, deletion block.`);
+    console.log(`${process.env.MVI_DOM ? 'DOM' : 'Browser'} smoke passed: initialization, recall, research retry/study, resources/lore, staged identity, native tool, task/event, runtime action, HUD injection, fresh task overlays, required/optional HUD timeouts, deletion block.`);
 } finally {
     await browser?.close();
     await new Promise(resolve => server.close(resolve));

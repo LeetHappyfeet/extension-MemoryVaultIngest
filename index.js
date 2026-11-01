@@ -163,7 +163,7 @@ listen('WORLD_INFO_ACTIVATED', entries => { lastLore = structuredClone(entries |
 listen('GENERATION_STOPPED', () => { generationController?.abort(); clearPrompt(); });
 listen('GENERATION_ENDED', () => { generationController?.abort(); });
 
-window[`${MODULE}_Intercept`] = async function (_chat, _contextSize, _abort, type) {
+window[`${MODULE}_Intercept`] = async function (_chat, _contextSize, abort, type) {
     clearPrompt();
     if (!settings().enabled || ['quiet', 'impersonate'].includes(type)) return;
     generationController?.abort();
@@ -172,20 +172,29 @@ window[`${MODULE}_Intercept`] = async function (_chat, _contextSize, _abort, typ
     const sequence = ++generationSequence;
     const timer = setTimeout(() => controller.abort(), Math.max(50, settings().generationBudgetMs));
     let onAbort;
+    let scope;
+    const unavailable = () => {
+        if (sequence !== generationSequence || (scope && !bridge.current(scope))) return;
+        const message = settings().requireHud
+            ? 'AIOS HUD unavailable within the generation budget. Generation stopped; wait for READY and retry.'
+            : 'AIOS HUD unavailable within the generation budget. This generation is continuing without AIOS context.';
+        show('mvi_runtime_status', message);
+        if (settings().requireHud) abort(true);
+    };
     try {
-        const scope = currentScope();
+        scope = currentScope();
         const cancelled = new Promise(resolve => {
             onAbort = () => resolve(null);
             controller.signal.addEventListener('abort', onAbort, { once: true });
         });
         const hud = await Promise.race([bridge.generationHud(scope, controller.signal), cancelled]);
         if (!hud || sequence !== generationSequence || controller.signal.aborted || !bridge.current(scope) ||
-            scope.live.blocked || !exactHud(hud, scope.data, scope.data.source_head_node_id)) return;
+            scope.live.blocked || !exactHud(hud, scope.data, scope.data.source_head_node_id)) { unavailable(); return; }
         const text = settings().tagWrapper
             ? `<aios_hud>\nAIOS runtime context for the active character; character/world state and retrieved knowledge, not user dialogue.\n\n${hud.text}\n</aios_hud>`
             : hud.text;
         setExtensionPrompt(MODULE, text, settings().position ?? extension_prompt_types.IN_PROMPT, settings().depth);
-    } catch (error) { report(error); }
+    } catch (error) { report(error); unavailable(); }
     finally {
         clearTimeout(timer);
         if (onAbort) controller.signal.removeEventListener('abort', onAbort);
@@ -293,7 +302,7 @@ async function initialize() {
         $('#extensions_settings2').append(html);
         const s = settings();
         el('mvi_api_root').value = s.apiRoot;
-        const controls = { mvi_enabled: 'enabled', mvi_cached_hud: 'useCachedHud', mvi_reconcile: 'reconcileOnChatLoad',
+        const controls = { mvi_enabled: 'enabled', mvi_require_hud: 'requireHud', mvi_reconcile: 'reconcileOnChatLoad',
             mvi_log_hud: 'logHudText', mvi_tag: 'tagWrapper', mvi_sync_cards: 'syncCards', mvi_native_recall: 'nativeRecall' };
         for (const [id, key] of Object.entries(controls)) {
             el(id).checked = s[key];
